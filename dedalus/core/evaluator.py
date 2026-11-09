@@ -6,7 +6,7 @@ from collections import defaultdict
 import pathlib
 import h5py
 import shutil
-import uuid
+import itertools
 import numpy as np
 import hashlib
 from math import prod
@@ -26,6 +26,7 @@ FILEHANDLER_TOUCH_TMPFILE = config['analysis'].getboolean('FILEHANDLER_TOUCH_TMP
 
 import logging
 logger = logging.getLogger(__name__.split('.')[-1])
+_evaluation_ids = itertools.count()
 
 
 class Evaluator:
@@ -95,9 +96,10 @@ class Evaluator:
     def evaluate_handlers(self, handlers, id=None, **kw):
         """Evaluate a collection of handlers."""
 
-        # Default to uuid to cache within evaluation, but not across evaluations
+        # Default to a new id to cache within evaluation, but not across evaluations
+        # (a process-local counter: uuid4 reads os.urandom, which can cost a fraction of a millisecond per call)
         if id is None:
-            id = uuid.uuid4()
+            id = ('evaluation', next(_evaluation_ids))
 
         tasks = [t for h in handlers for t in h.tasks]
         for task in tasks:
