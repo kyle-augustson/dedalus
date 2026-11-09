@@ -27,6 +27,7 @@ from ..tools.exceptions import NonlinearOperatorError
 from ..tools.exceptions import SymbolicParsingError
 from ..tools.exceptions import SkipDispatchException
 from ..tools.general import unify_attributes, DeferredTuple
+from ..tools import kron as fast_kron
 
 # Public interface
 __all__ = ['Add',
@@ -190,7 +191,10 @@ class Add(Future, metaclass=MultiClass):
         for arg in self.args:
             arg_matrices = arg.expression_matrices(subproblem, vars, **kw)
             for var in arg_matrices:
-                matrices[var] = matrices.get(var, 0) + arg_matrices[var]
+                if var in matrices:
+                    matrices[var] = matrices[var] + arg_matrices[var]
+                else:
+                    matrices[var] = arg_matrices[var]
         return matrices
 
 
@@ -444,18 +448,27 @@ class Product(Future):
             Gamma = self.GammaCoord(arg.tensorsig, ncc.tensorsig, out.tensorsig)
             Gamma = Gamma.transpose((2, 0, 1))
         # Loop over NCC modes
-        shape = (subproblem.field_size(out), subproblem.field_size(arg))
-        matrix = sparse.csr_matrix(shape, dtype=self.dtype)
         subproblem_shape = subproblem.coeff_shape(out.domain)
         ncc_rank = len(ncc.tensorsig)
         select_all_comps = tuple(slice(None) for i in range(ncc_rank))
+        data = []
+        row = []
+        col = []
         if np.any(self._ncc_data):
             for ncc_mode in np.ndindex(self._ncc_data.shape[ncc_rank:]):
                 ncc_coeffs = self._ncc_data[select_all_comps + ncc_mode]
                 if np.max(np.abs(ncc_coeffs)) > ncc_cutoff:
                     mode_matrix = self.cartesian_mode_matrix(subproblem_shape, ncc.domain, arg.domain, out.domain, ncc_mode)
-                    mode_matrix = sparse.kron(np.dot(Gamma, ncc_coeffs.ravel()), mode_matrix, format='csr')
-                    matrix = matrix + mode_matrix
+                    mode_matrix_data = fast_kron.fast_kron_dense_sparse(np.dot(Gamma, ncc_coeffs.ravel()), mode_matrix, return_data=True)
+                    data.append(mode_matrix_data[1])
+                    row.append(mode_matrix_data[2])
+                    col.append(mode_matrix_data[3])
+        if data:
+            data = np.concatenate(data)
+            row = np.concatenate(row)
+            col = np.concatenate(col)
+        shape = (subproblem.field_size(out), subproblem.field_size(arg))
+        matrix = sparse.csr_matrix((data, (row, col)), shape=shape, dtype=self.dtype)
         return matrix
 
     @classmethod
@@ -465,13 +478,13 @@ class Product(Future):
             arg_basis = arg_domain.full_bases[axis]
             out_basis = out_domain.full_bases[axis]
             if ncc_basis is None:
-                mode_matrix = sparse.identity(subproblem_shape[axis], format='csr')
+                mode_matrix = sparse.identity(subproblem_shape[axis], format='coo')
             else:
-                mode_matrix = ncc_basis.product_matrix(arg_basis, out_basis, ncc_mode[axis])
+                mode_matrix = ncc_basis.product_matrix(arg_basis, out_basis, ncc_mode[axis]).tocoo()
             if axis == 0:
                 matrix = mode_matrix
             else:
-                matrix = sparse.kron(matrix, mode_matrix, format='csr')
+                matrix = sparse.kron(matrix, mode_matrix, format='coo')
         return matrix
 
     # def _ncc_matrix_recursion(self, subproblem, ncc_bases, arg_bases, coeffs, ncc_comp, arg_comp, out_comp, **kw):
