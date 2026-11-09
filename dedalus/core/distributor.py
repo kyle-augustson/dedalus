@@ -22,6 +22,7 @@ GROUP_TRANSFORMS = config['transforms'].getboolean('GROUP_TRANSFORMS')
 TRANSPOSE_LIBRARY = config['parallelism'].get('TRANSPOSE_LIBRARY')
 GROUP_TRANSPOSES = config['parallelism'].getboolean('GROUP_TRANSPOSES')
 SYNC_TRANSPOSES = config['parallelism'].getboolean('SYNC_TRANSPOSES')
+MESH_AXIS0_NODE_LOCAL = config['parallelism'].getboolean('MESH_AXIS0_NODE_LOCAL', fallback=False)
 
 if TRANSPOSE_LIBRARY.upper() == 'FFTW':
     from .transposes import FFTWTranspose as TransposePlanner
@@ -106,6 +107,12 @@ class Distributor:
             raise ValueError("Mesh (%s) must have lower dimension than distributor (%i)" %(mesh, dim))
         if prod(mesh) != comm.size:
             raise ValueError("Wrong number of processes (%i) for specified mesh (%s)" %(comm.size, mesh))
+        # Optionally relabel ranks so mesh axis 0 varies fastest over the communicator ranks: with mesh[0] dividing the
+        # ranks per node, the transposes over mesh axis 0 (for spherical bases, the dealiased colatitude-azimuth ones,
+        # the larger exchange) then stay within a node
+        if MESH_AXIS0_NODE_LOCAL:
+            from ..tools.fastpaths import axis0_first_comm
+            self.comm = comm = axis0_first_comm(comm, mesh)
         self.dtype = dtype
         # Create cartesian communicator, ignoring axes with m=1
         reduced_mesh = [m for m in mesh if m > 1]
