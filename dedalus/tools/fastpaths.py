@@ -438,6 +438,46 @@ def _radius_plan(self, field, axis, gdata):
     return rb, plan
 
 
+def _csr32(M):
+    M = M.tocsr()
+    return (np.ascontiguousarray(M.indptr, dtype=np.int32), np.ascontiguousarray(M.indices, dtype=np.int32),
+            np.ascontiguousarray(M.data, dtype=np.float64))
+
+
+_NOCSR = (np.zeros(1, np.int32), np.zeros(1, np.int32), np.zeros(1))
+
+
+def _cheb_params(plan):
+    """Parameters of a FastChebyshevTransform's resize/rescale steps for fast_kernels.cheb_backward/forward, or None
+    for a direction whose method is not one of the two known variants (then the original per-component calls run)."""
+    p = plan.__dict__.get('_fast_cheb')
+    if p is not None:
+        return p
+    from ..core import transforms
+    FCT = transforms.FastChebyshevTransform
+    p = {}
+    fb = getattr(plan.resize_rescale_backward, '__func__', None)
+    if fb is FCT._resize_rescale_backward:
+        p['b'] = (plan.Kmax, plan.backward_rescale_zero, plan.backward_rescale_pos, plan.KN > plan.Kmax, False, False) + _NOCSR
+    elif fb is FCT._resize_rescale_backward_convert:
+        K = plan.Kmax_orig
+        p['b'] = (K, plan.backward_rescale_zero, plan.backward_rescale_pos, plan.KN > K, True, plan.M_orig > plan.N) + _csr32(plan.backward_conversion)
+    else:
+        p['b'] = None
+    ff = getattr(plan.resize_rescale_forward, '__func__', None)
+    if ff is FCT._resize_rescale_forward:
+        p['f'] = (plan.Kmax, plan.forward_rescale_zero, plan.forward_rescale_pos, plan.KM > plan.Kmax, False) + _NOCSR
+    elif ff is FCT._resize_rescale_forward_convert:
+        p['f'] = (plan.Kmax, plan.forward_rescale_zero, plan.forward_rescale_pos, plan.KM > plan.Kmax, True) + _csr32(plan.forward_conversion)
+    else:
+        p['f'] = None
+    plan.__dict__['_fast_cheb'] = p
+    return p
+
+
+_xtmp = [np.zeros(0)]
+
+
 def _radius_forward(self, field, axis, gdata, cdata):
     r = _radius_plan(self, field, axis, gdata)
     if r is None or not cdata.flags.c_contiguous:
@@ -452,6 +492,12 @@ def _radius_forward(self, field, axis, gdata, cdata):
     W = _workspace('rad', gdata.shape)
     g2 = gdata.reshape(-1, gdata.shape[-1]); W2 = W.reshape(g2.shape)
     _dct_plan(g2.shape, 1).forward(g2, W2)
+    cp = _cheb_params(plan)['f']
+    if cp is not None and hasattr(_kern, 'cheb_forward'):
+        K, r0, rp, zero_bad, convert, Ap, Aj, Ax = cp
+        Nc = cdata.shape[-1]
+        _kern.cheb_forward(W2.reshape(-1), cdata.reshape(-1), g2.shape[0], g2.shape[1], Nc, K, r0, rp, zero_bad, convert, Nc, Ap, Aj, Ax)
+        return True
     R = rb.regularity_classes(field.tensorsig)
     for i, rt in np.ndenumerate(R):
         plan.resize_rescale_forward(W[i], cdata[i], axis, plan.Kmax)
@@ -466,9 +512,18 @@ def _radius_backward(self, field, axis, cdata, gdata):
     data_axis = len(field.tensorsig) + axis
     # per-component rescale/convert from cdata into a workspace (all reads of cdata happen before gdata is written)
     W = _workspace('rad', gdata.shape)
-    R = rb.regularity_classes(field.tensorsig)
-    for i, rt in np.ndenumerate(R):
-        plan.resize_rescale_backward(cdata[i], W[i], axis, plan.Kmax)
+    cp = _cheb_params(plan)['b']
+    if cp is not None and hasattr(_kern, 'cheb_backward'):
+        K, r0, rp, zero_bad, convert, truncate_in, Ap, Aj, Ax = cp
+        Nc, Ng = cdata.shape[-1], gdata.shape[-1]
+        if _xtmp[0].size < Nc:
+            _xtmp[0] = np.zeros(Nc)
+        _kern.cheb_backward(cdata.reshape(-1), W.reshape(-1), cdata.size // Nc, Nc, Ng, K, r0, rp, zero_bad, convert,
+                            truncate_in, Ap, Aj, Ax, _xtmp[0])
+    else:
+        R = rb.regularity_classes(field.tensorsig)
+        for i, rt in np.ndenumerate(R):
+            plan.resize_rescale_backward(cdata[i], W[i], axis, plan.Kmax)
     W2 = W.reshape(-1, W.shape[-1]); g2 = gdata.reshape(W2.shape)
     _dct_plan(W2.shape, 1).backward(W2, g2)
     rb.backward_regularity_recombination(field.tensorsig, axis, gdata, self.ell_maps(field.dist))
