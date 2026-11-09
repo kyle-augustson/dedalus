@@ -23,6 +23,7 @@ from .field import Operand, Field, LockedField
 from .future import Future, FutureField, FutureLockedField
 from ..tools.array import reshape_vector, apply_matrix, add_sparse, axindex, axslice, perm_matrix, copyto, sparse_block_diag, interleave_matrices
 from ..tools.cache import CachedAttribute, CachedMethod
+from ..tools import fastpaths
 from ..tools.dispatch import MultiClass
 from ..tools.exceptions import NonlinearOperatorError
 from ..tools.exceptions import SymbolicParsingError
@@ -3154,6 +3155,8 @@ class SphericalEllOperator(SpectralOperator):
 
     def operate(self, out):
         """Perform operation."""
+        if fastpaths.ell_operate(self, self.args[0], out, curl_like=False):
+            return
         operand = self.args[0]
         if self.input_basis is None:
             basis = self.output_basis
@@ -3964,6 +3967,8 @@ class SphericalCurl(Curl, SphericalEllOperator):
         """Perform operation."""
         if self.dtype == np.complex128:
             return super().operate(out)
+        if fastpaths.ell_operate(self, self.args[0], out, curl_like=True):
+            return
         operand = self.args[0]
         input_basis = self.input_basis
         radial_basis = self.radial_basis

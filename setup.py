@@ -165,7 +165,8 @@ pyx_modules = [
     "dedalus.core.transposes",
     "dedalus.tools.linalg",
     "dedalus.libraries.fftw.fftw_wrappers",
-    "dedalus.libraries.spin_recombination"]
+    "dedalus.libraries.spin_recombination",
+    "dedalus.libraries.fast_kernels"]
 extensions = []
 for name in pyx_modules:
     extensions.append(
@@ -176,7 +177,8 @@ for name in pyx_modules:
             libraries=libraries,
             library_dirs=library_dirs,
             runtime_library_dirs=library_dirs,
-            extra_compile_args=extra_compile_args,
+            # fast_kernels: no FMA contraction, so its products match the numexpr expressions bit for bit
+            extra_compile_args=extra_compile_args + (["-ffp-contract=off"] if name.endswith("fast_kernels") else []),
             extra_link_args=extra_link_args))
 
 # Runtime requirements
