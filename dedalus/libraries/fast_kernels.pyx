@@ -225,3 +225,83 @@ def dot3(const double[::1] a0, const double[::1] a1, const double[::1] a2,
     with nogil:
         for i in range(n):
             o[i] = a0[i] * b0[i] + a1[i] * b1[i] + a2[i] * b2[i]
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Chebyshev radial transforms (FFTW DCT with ultraspherical conversion). These reproduce, pencil by pencil and in the
+# same operation order, FastChebyshevTransform's resize/rescale methods (with and without conversion) around the DCT,
+# including Dedalus's solve_upper_csr and apply_csr loops, so the results are bitwise identical to the original path.
+
+from libc.stdint cimport int32_t
+
+
+def cheb_backward(const double[::1] cdata, double[::1] W, int64_t npen, int64_t Nc, int64_t Ng, int64_t K,
+                  double r0, double rp, bint zero_bad, bint convert, bint truncate_in,
+                  const int32_t[::1] Ap, const int32_t[::1] Aj, const double[::1] Ax, double[::1] x):
+    """Coefficients (npen, Nc) -> DCT input W (npen, Ng): [truncate, upper-triangular solve,] sign of odd modes,
+    rescale, zero padding. K is Kmax (no conversion) or Kmax_orig (conversion)."""
+    cdef int64_t p, i, jj, ci, wo
+    cdef double s
+    with nogil:
+        for p in range(npen):
+            ci = p * Nc
+            wo = p * Ng
+            for i in range(Nc):
+                x[i] = cdata[ci + i]
+            if convert:
+                if truncate_in:
+                    for i in range(K + 1, Nc):
+                        x[i] = 0
+                for i in range(Nc - 1, -1, -1):
+                    s = x[i]
+                    for jj in range(Ap[i + 1] - 1, Ap[i], -1):
+                        s = s - Ax[jj] * x[Aj[jj]]
+                    x[i] = s / Ax[Ap[i]]
+            if K > 0:
+                for i in range(1, K + 1, 2):
+                    x[i] = x[i] * -1
+            W[wo] = x[0] * r0
+            if K > 0:
+                for i in range(1, K + 1):
+                    W[wo + i] = x[i] * rp
+                if zero_bad:
+                    for i in range(K + 1, Ng):
+                        W[wo + i] = 0
+
+
+def cheb_forward(double[::1] W, double[::1] cdata, int64_t npen, int64_t Ng, int64_t Nc, int64_t K,
+                 double r0, double rp, bint zero_bad, bint convert, int64_t n_in,
+                 const int32_t[::1] Ap, const int32_t[::1] Aj, const double[::1] Ax):
+    """DCT output W (npen, Ng) -> coefficients (npen, Nc): rescale, [zero bad modes,] sign of odd modes,
+    [truncate to n_in and apply the CSR conversion]. W is used as scratch."""
+    cdef int64_t p, i, jj, ci, wo
+    cdef double s
+    with nogil:
+        for p in range(npen):
+            ci = p * Nc
+            wo = p * Ng
+            if convert:
+                W[wo] = W[wo] * r0
+                if K > 0:
+                    for i in range(1, K + 1):
+                        W[wo + i] = W[wo + i] * rp
+                    if zero_bad:
+                        for i in range(K + 1, Ng):
+                            W[wo + i] = 0
+                    for i in range(1, K + 1, 2):
+                        W[wo + i] = W[wo + i] * -1
+                for i in range(Nc):
+                    s = 0.0
+                    for jj in range(Ap[i], Ap[i + 1]):
+                        s = s + Ax[jj] * W[wo + Aj[jj]]
+                    cdata[ci + i] = s
+            else:
+                cdata[ci] = W[wo] * r0
+                if K > 0:
+                    for i in range(1, K + 1):
+                        cdata[ci + i] = W[wo + i] * rp
+                    if zero_bad:
+                        for i in range(K + 1, Nc):
+                            cdata[ci + i] = 0
+                    for i in range(1, K + 1, 2):
+                        cdata[ci + i] = cdata[ci + i] * -1
