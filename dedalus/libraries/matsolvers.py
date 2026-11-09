@@ -98,6 +98,14 @@ class _SuperluSpsolveBase(SparseSolver):
             out = out[:, None]
         return out
 
+    def solve_H(self,vector):
+        matrix_H = self.matrix.conj().T
+        out = spla.spsolve(matrix_H, vector, permc_spec=self.permc_spec, use_umfpack=False)
+        # Fix return shape for matrices
+        if vector.ndim == 2 and out.ndim == 1:
+            out = out[:, None]
+        return out
+
 
 @add_solver
 class SuperluNaturalSpsolve(_SuperluSpsolveBase):
@@ -136,6 +144,7 @@ class _SuperluFactorizedBase(SparseSolver):
     def __init__(self, matrix, solver=None):
         if self.trans == "T":
             matrix = matrix.T
+            self.trans_adjoint = "N"
         elif self.trans == "H":
             matrix = matrix.conj().T
         self.LU = spla.splu(matrix.tocsc(),

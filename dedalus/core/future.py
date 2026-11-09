@@ -4,6 +4,7 @@ Classes for future evaluation.
 """
 
 import numpy as np
+import uuid
 from functools import partial
 
 from .field import Operand, Field, LockedField
@@ -41,7 +42,7 @@ class Future(Operand):
 
     store_last = STORE_LAST_DEFAULT
 
-    def __init__(self, *args, out=None):
+    def __init__(self, *args, out=None, tangent=None, cotangent=None):
         # # Check output consistency
         # if out is not None:
         #     if out.bases != self.bases:
@@ -50,6 +51,8 @@ class Future(Operand):
         self.args = list(args)
         self.original_args = tuple(args)
         self.out = out
+        self.tangent = tangent
+        self.cotangent = cotangent
         self.dist = unify_attributes(args, 'dist', require=False)
         #self.domain = Domain(self.dist, self.bases)
         self._grid_layout = self.dist.grid_layout
@@ -95,6 +98,11 @@ class Future(Operand):
     def reset(self):
         """Restore original arguments."""
         self.args = list(self.original_args)
+
+    def reset_jvp(self):
+        """Restore original arguments."""
+        self.args = list(self.original_args)
+        self.arg_tangents = [None] * len(self.args)
 
     def atoms(self, *types):
         """Gather all leaf-operands of specified types."""
@@ -160,8 +168,12 @@ class Future(Operand):
         for arg in self.args:
             arg.gather_ncc_coeffs()
 
-    def evaluate(self, id=None, force=True):
+    def evaluate(self, id=None, force=True, tape=None, clean_tangent=False):
         """Recursively evaluate operation."""
+
+        # Default to uuid to cache within evaluation, but not across evaluations
+        if id is None:
+            id = uuid.uuid4()
 
         # Check storage
         if self.store_last and (id is not None):
@@ -179,7 +191,7 @@ class Future(Operand):
             if isinstance(a, Field):
                 a.change_scales(a.domain.dealias)
             if isinstance(a, Future):
-                a_eval = a.evaluate(id=id, force=force)
+                a_eval = a.evaluate(id=id, force=force, tape=tape)
                 # If evaluation succeeds, substitute result
                 if a_eval is not None:
                     self.args[i] = a_eval
@@ -209,6 +221,10 @@ class Future(Operand):
         # Perform operation
         self.operate(out)
 
+        # Add to tape
+        if tape is not None:
+            tape.append(self)
+
         # Reset to free temporary field arguments
         self.reset()
 
@@ -217,7 +233,144 @@ class Future(Operand):
             self.last_id = id
             self.last_out = out
 
+        if clean_tangent:
+            self.tangent.data.fill(0)
+
         return out
+
+    def evaluate_jvp(self, tangents, id=None, force=True):
+        """Recursively evaluate operation."""
+
+        # Default to uuid to cache within evaluation, but not across evaluations
+        if id is None:
+            id = uuid.uuid4()
+
+        # Check storage
+        if self.store_last and (id is not None):
+            if id == self.last_id:
+                return self.last_out, self.last_tangent
+            else:
+                # Clear cache to free output field
+                self.last_id = None
+                self.last_out = None
+                self.last_tangent = NotImplementedError
+
+        # Recursively attempt evaluation of all operator arguments
+        # Track evaluation success with flag
+        self.arg_tangents = [None] * len(self.args)
+        all_eval = True
+        for i, a in enumerate(self.args):
+            if isinstance(a, Field):
+                a.change_scales(a.domain.dealias)
+                if a in tangents:
+                    tangents[a].change_scales(tangents[a].domain.dealias)
+                    self.arg_tangents[i] = tangents[a]
+            if isinstance(a, Future):
+                a_eval = a.evaluate_jvp(tangents, id=id, force=force)
+                # If evaluation succeeds, substitute result
+                if a_eval is not None:
+                    self.args[i] = a_eval[0]
+                    self.arg_tangents[i] = a_eval[1]
+                # Otherwise change flag
+                else:
+                    all_eval = False
+        # Return None if any arguments are not evaluable
+        if not all_eval:
+            return None
+
+        # Check conditions unless forcing evaluation
+        if force:
+            self.enforce_conditions()
+        else:
+            # Return None if operator conditions are not satisfied
+            if not self.check_conditions():
+                return None
+
+        # Match tangent layouts to arguments
+        for i in range(len(self.args)):
+            if self.arg_tangents[i] is not None:
+                self.arg_tangents[i].change_layout(self.args[i].layout)
+
+        # Setup output field
+        out = self.get_out()
+        out.preset_scales(self.domain.dealias)
+
+        # Call operation
+        if any(self.arg_tangents):
+            # Setup tangent field
+            tangent = self.get_tangent()
+            tangent.preset_scales(self.domain.dealias)
+            self.operate_jvp(out, tangent)
+        else:
+            tangent = None
+            self.operate(out)
+
+        # Reset to free temporary field arguments
+        self.reset_jvp()
+
+        # Update storage
+        if self.store_last and (id is not None):
+            self.last_id = id
+            self.last_out = out
+            self.last_tangent = tangent
+
+        return out, tangent
+
+    def evaluate_vjp(self, cotangents, id=None, force=False):
+        """Recursively evaluate operation."""
+
+        cotangent = cotangents[self]
+
+        # Force store_last
+        # TODO: enforce recursively
+        self.store_last = True
+        if id is None:
+            raise ValueError("id must be specified for vjp evaluation.")
+
+        # Check cotangent basis and adjoint status
+        if not cotangent.adjoint:
+            raise ValueError("Cotangent must be an adjoint field.")
+        if cotangent.domain != self.domain:
+            raise ValueError("Cotangent must have same domain as operator.")
+
+        # Forward evaluate and save topological sorting
+        if id == self.last_id:
+            tape = self.last_tape
+            out = self.last_out
+        else:
+            tape = []
+            out = self.evaluate(id=id, force=force, tape=tape)
+            self.last_tape = tape
+
+        # Clean cotangents and set scales
+        for op in tape:
+            op.get_cotangent()
+            if op is not self:
+                op.cotangent.preset_scales(op.domain.dealias)
+                op.cotangent.data.fill(0)
+            for arg in op.original_args:
+                if isinstance(arg, Field) and arg in cotangents:
+                    cotangents[arg].change_scales(arg.domain.dealias)
+
+        # Copy input cotangent
+        self.cotangent.preset_layout(cotangent.layout)
+        self.cotangent.data[:] = cotangent.data
+        self.cotangent.change_scales(self.domain.dealias)
+
+        # Reverse topological sorting and evaluate adjoint
+        for op in tape[::-1]:
+            # Replace arguments with operator outputs
+            for i in range(len(op.args)):
+                if isinstance(op.args[i], Future):
+                    op.args[i] = op.args[i].out
+            # Enforce conditions to get correct arg layouts
+            layout = op.enforce_conditions()
+            # Evaluate adoint
+            op.operate_vjp(layout, cotangents)
+            # Reset arguments
+            op.reset()
+
+        return out, cotangents
 
     def get_out(self):
         if self.out:
@@ -228,6 +381,25 @@ class Future(Operand):
                 self.out = out
             return out
 
+    def get_tangent(self):
+        if self.tangent:
+            return self.tangent
+        else:
+            tangent = self.build_out()
+            if STORE_OUTPUTS:
+                self.tangent = tangent
+            return tangent
+
+    def get_cotangent(self):
+        if self.cotangent:
+            return self.cotangent
+        else:
+            cotangent = self.build_out()
+            cotangent.adjoint = True
+            if STORE_OUTPUTS:
+                self.cotangent = cotangent
+            return cotangent
+
     def build_out(self):
         bases = self.domain.bases
         if any(bases):
@@ -235,38 +407,112 @@ class Future(Operand):
         else:
             return self.future_type(dist=self.dist, tensorsig=self.tensorsig, dtype=self.dtype, name=str(self))
 
-    def attempt(self, id=None):
+    def attempt(self, id=None, **kw):
         """Recursively attempt to evaluate operation."""
-        return self.evaluate(id=id, force=False)
+        return self.evaluate(id=id, force=False, **kw)
 
     def check_conditions(self):
         """Check that arguments are in a proper layout."""
         # This method must be implemented in derived classes and should return
         # a boolean indicating whether the operation can be computed without
         # changing the layout of any of the field arguments.
-        raise NotImplementedError()
+        raise NotImplementedError(f"check_conditions not implemented for {type(self)}")
 
     def enforce_conditions(self):
         """Require arguments to be in a proper layout."""
-        raise NotImplementedError()
+        raise NotImplementedError(f"enforce_conditions not implemented for {type(self)}")
 
     def operate(self, out):
         """Perform operation."""
         # This method must be implemented in derived classes, take an output
         # field as its only argument, and evaluate the operation into this
         # field without modifying the data of the arguments.
-        raise NotImplementedError()
+        raise NotImplementedError(f"operate not implemented for {type(self)}")
 
-    # def order(self, *ops):
-    #     order = max(arg.order(*ops) for arg in self.args)
-    #     if type(self) in ops:
-    #         order += 1
-    #     return order
+    def operate_jvp(self, out, tangent):
+        """Perform operation."""
+        raise NotImplementedError(f"operate_jvp not implemented for {type(self)}")
 
-
-
+    def operate_vjp(self, cotangents):
+        raise NotImplementedError(f"operate_vjp not implemented for {type(self)}")
 
 
+class ExpressionList:
+    """TODO: decide to merge with SystemHandler"""
+
+    def __init__(self, evaluator, expressions):
+        self.evaluator = evaluator
+        self.system_handler = evaluator.add_system_handler()
+        self.system_handler.add_tasks(expressions)
+        #self.system_handler.build_system() # dont do this
+        self.expressions = expressions
+        self.last_id = None
+
+    def tape_evaluate(self, id=None, force=False):
+        if id is None:
+            raise ValueError("id must be specified for taped evaluation.")
+        if id == self.last_id:
+            out = self.last_out
+            tape = self.last_tape
+        else:
+            # Force store_last
+            # TODO: enforce recursively
+            for expr in self.expressions:
+                self.store_last = True
+            # Jointly evaluate
+            tape = []
+            if force:
+                out = []
+                for expr in self.expressions:
+                    out.append(expr.evaluate(id=id, force=force, tape=tape))
+            else:
+                self.evaluator.evaluate_handlers([self.system_handler], id=id, tape=tape)
+                out = [expr.out for expr in self.expressions]
+            # Update storage
+            self.last_id = id
+            self.last_out = out
+            self.last_tape = tape
+        return out, tape
+
+    def evaluate_vjp(self, cotangents, id=None, force=False):
+        if id is None:
+            raise ValueError("id must be specified for vjp evaluation.")
+        # Run forward evaluation and build joint tape (cached by id)
+        out, tape = self.tape_evaluate(id, force=force)
+        # Clean cotangents and set scales
+        for op in tape:
+            op.get_cotangent()
+            if op not in self.expressions:
+                op.cotangent.preset_scales(op.domain.dealias)
+                op.cotangent.data.fill(0)
+            for arg in op.original_args:
+                if isinstance(arg, Field) and arg in cotangents:
+                    cotangents[arg].change_scales(arg.domain.dealias)
+        # Initialize expression cotangents
+        for expr in self.expressions:
+            cotangent = cotangents[expr]
+            # Check cotangent basis and adjoint status
+            if not cotangent.adjoint:
+                raise ValueError("Cotangent must be an adjoint field.")
+            if cotangent.domain != expr.domain:
+                raise ValueError("Cotangent must have same domain as operator.")
+            # Copy input cotangents
+            expr.cotangent.preset_layout(cotangent.layout)
+            expr.cotangent.data[:] = cotangent.data
+            expr.cotangent.change_scales(expr.domain.dealias)
+        # Reverse topological sorting and evaluate adjoints
+        for op in tape[::-1]:
+            # Replace arguments with operator outputs
+            for i in range(len(op.args)):
+                if isinstance(op.args[i], Future):
+                    op.args[i] = op.args[i].out
+            # Enforce conditions to get correct arg layouts
+            layout = op.enforce_conditions()
+            # Evaluate adoint
+            op.operate_vjp(layout, cotangents)
+            # Reset arguments
+            op.reset()
+        return out, cotangents
 
 
 class FutureField(Future):

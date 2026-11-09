@@ -557,7 +557,7 @@ class Field(Current):
 
     """
 
-    def __init__(self, dist, bases=None, name=None, tensorsig=None, dtype=None):
+    def __init__(self, dist, bases=None, name=None, tensorsig=None, dtype=None, adjoint=False):
         if bases is None:
             bases = tuple()
         # Accept single basis in place of tuple/list
@@ -584,6 +584,8 @@ class Field(Current):
         self.preset_scales((1,) * self.dist.dim)
         # Add weak reference to distributor
         dist.fields.add(self)
+        # Whether to use adjoint transforms/operators or not
+        self.adjoint = adjoint
 
     def __getitem__(self, key):
         """Return data viewed in specified layout and scales."""
@@ -630,6 +632,12 @@ class Field(Current):
         copy.preset_scales(self.scales)
         copy[self.layout] = self.data
         return copy
+
+    def get_cotangent(self):
+        cotangent = Field(self.dist, bases=self.domain.bases, tensorsig=self.tensorsig, dtype=self.dtype, adjoint=True)
+        if self.name:
+            cotangent.name = f"Y_{self.name}"
+        return cotangent
 
     def set_global_data(self, global_data):
         elements = self.layout.local_elements(self.domain, self.scales)

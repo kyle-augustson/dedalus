@@ -11,14 +11,19 @@ import pstats
 from math import prod
 from collections import defaultdict
 import pickle
+import uuid
+from .field import Field
+from .future import ExpressionList
 
 from . import subsystems
 from . import timesteppers
 from .evaluator import Evaluator
+from .operators import Convert
 from ..libraries.matsolvers import matsolvers
 from ..tools.config import config
 from ..tools.array import scipy_sparse_eigs
 from ..tools.parallel import ProfileWrapper, parallel_mkdir
+from ..extras.adjoint import build_cotangent_list
 
 PROFILE_DEFAULT = config['profiling'].getboolean('PROFILE_DEFAULT')
 PARALLEL_PROFILE_DEFAULT = config['profiling'].getboolean('PARALLEL_PROFILE_DEFAULT')
@@ -162,6 +167,7 @@ class EigenvalueSolver(SolverBase):
     def __init__(self, problem, **kw):
         logger.debug('Beginning EVP instantiation')
         super().__init__(problem, **kw)
+        self.adjoint_state = None
         logger.debug('Finished EVP instantiation')
 
     def print_subproblem_ranks(self, subproblems=None, target=0):
@@ -306,19 +312,74 @@ class EigenvalueSolver(SolverBase):
             If an integer, the corresponding subsystem of the last specified
             eigenvalue_subproblem will be used. Default: 0.
         """
-        # TODO: allow setting left modified eigenvectors?
         subproblem = self.eigenvalue_subproblem
         if isinstance(subsystem, int):
             subsystem = subproblem.subsystems[subsystem]
-        # Check selection
-        if subsystem not in subproblem.subsystems:
-            raise ValueError("subsystem must be in eigenvalue_subproblem")
-        # Set coefficients
+        elif subsystem not in subproblem.subsystems:
+            raise ValueError("subsystem must be in eigenvalue_subproblem.subsystems")
+        # Set state to right eigenvector
         for var in self.state:
             var['c'] = 0
         subsystem.scatter(self.eigenvectors[:, index], self.state)
         # Set eigenvalue
         self.problem.eigenvalue['g'] = self.eigenvalues[index]
+
+    def set_adjoint_state(self, index, subsystem=0):
+        """
+        Set adjoint state vector to the specified left eigenmode.
+
+        Parameters
+        ----------
+        index : int
+            Index of desired eigenmode.
+        subsystem : Subsystem object or int, optional
+            Subsystem that will be set to the corresponding eigenmode.
+            If an integer, the corresponding subsystem of the last specified
+            eigenvalue_subproblem will be used. Default: 0.
+        """
+        subproblem = self.eigenvalue_subproblem
+        if isinstance(subsystem, int):
+            subsystem = subproblem.subsystems[subsystem]
+        elif subsystem not in subproblem.subsystems:
+            raise ValueError("subsystem must be in eigenvalue_subproblem.subsystems")
+        # Allocate adjoint state fields
+        if self.adjoint_state is None:
+            R = [eqn['R'] for eqn in self.problem.equations]
+            self.adjoint_state = build_cotangent_list(R, {})
+        # Set adjoint state to left eigenvector
+        for var in self.adjoint_state:
+            var['c'] = 0
+        subsystem.scatter(self.left_eigenvectors[:, index], self.adjoint_state)
+        # Set eigenvalue
+        self.problem.eigenvalue['g'] = self.eigenvalues[index]
+
+    def compute_eigenvalue_sensitivities(self, index, subsystem=0, id=None):
+        # Adjoint state solution for eigenvalue sensitivities is just left eigenvectors
+        self.set_state(index, subsystem=subsystem)
+        self.set_adjoint_state(index, subsystem=subsystem)
+        # Negate adjoint values before VJP
+        for Yi in self.adjoint_state:
+            Yi.data *= -1
+        # Compute sensitivities from residual expressions R = λ*M.X + L.X
+        cotangents = {}
+        expressions = []
+        for i, eqn in enumerate(self.problem.equations):
+            R = eqn['R']
+            if isinstance(R, Field):
+                # Here R=X in the state, need to accumulate Y[i]
+                raise ValueError("Not implemented")
+            else:
+                expressions.append(R)
+                cotangents[R] = self.adjoint_state[i]
+        expressions = ExpressionList(self.evaluator, expressions)
+        # Default to uuid to cache within evaluation, but not across evaluations
+        if id is None:
+            id = uuid.uuid4()
+        _, cotangents = expressions.evaluate_vjp(cotangents, id=id, force=True)
+        # Unnegate adjoint state after VJP for correct normalization
+        for Yi in self.adjoint_state:
+            Yi.data *= -1
+        return cotangents
 
 
 class LinearBoundaryValueSolver(SolverBase):
@@ -347,6 +408,7 @@ class LinearBoundaryValueSolver(SolverBase):
         super().__init__(problem, **kw)
         self.subproblem_matsolvers = {}
         self.iteration = 0
+        self.subproblem_matsolvers_adjoint = {}
         # Create RHS handler
         F_handler = self.evaluator.add_system_handler(iter=1, group='F')
         for eq in problem.eqs:
@@ -365,6 +427,12 @@ class LinearBoundaryValueSolver(SolverBase):
                 continue
             L = sp.L_min.toarray()
             print(f"MPI rank: {self.dist.comm.rank}, subproblem: {i}, group: {sp.group}, matrix rank: {np.linalg.matrix_rank(L)}/{L.shape[0]}, cond: {np.linalg.cond(L):.1e}")
+
+    def evaluate_handlers(self, handlers=None):
+        """Evaluate specified list of handlers (all by default)."""
+        if handlers is None:
+            handlers = self.evaluator.handlers
+        self.evaluator.evaluate_handlers(handlers, iteration=self.iteration)
 
     def solve(self, subproblems=None, rebuild_matrices=False):
         """
@@ -408,11 +476,84 @@ class LinearBoundaryValueSolver(SolverBase):
             sp.scatter_inputs(spX, self.state)
         self.iteration += 1
 
-    def evaluate_handlers(self, handlers=None):
-        """Evaluate specified list of handlers (all by default)."""
-        if handlers is None:
-            handlers = self.evaluator.handlers
-        self.evaluator.evaluate_handlers(handlers, iteration=self.iteration)
+    def solve_adjoint(self, H, subproblems=None):
+        """
+        Solve adjoint BVP over selected subproblems.
+
+        Parameters
+        ----------
+        H : list of cotangent fields
+            RHS for adjoint state equation, one cotangent field for each state variable.
+        subproblems : Subproblem object or list of Subproblem objects, optional
+            Subproblems for which to solve the BVP (default: None (all)).
+        """
+        # Resolve subproblems
+        if subproblems is None:
+            subproblems = self.subproblems
+        if isinstance(subproblems, subsystems.Subproblem):
+            subproblems = [subproblems]
+        # Evaluate RHS of adjoint state equation
+        # TODO: see if an evaluator for these is worthwhile
+        H = [Hi.evaluate() for Hi in H]
+        # Allocate adjoint state fields
+        Y = build_cotangent_list(self.F, {})
+        # Ensure coeff space before subsystem gathers/scatters
+        for field in H:
+            field.change_layout('c')
+        for field in Y:
+            field.preset_layout('c')
+        # Solve adjoint state equation for each subproblem
+        for sp in subproblems:
+            # Gather RHS (includes adjoint of right preconditioner)
+            H_sp = sp.gather_inputs(H)
+            # Adjoint solve
+            Y_sp = self.subproblem_matsolvers[sp].solve_H(H_sp)  # CREATES TEMPORARY
+            # Scatter state (contains adjoint of left preconditioner)
+            sp.scatter_outputs(Y_sp, Y)
+        return Y
+
+    def compute_sensitivities(self, cotangents, id=None, subproblems=None):
+        """
+        Propagate cotangents through BVP via adjoint solution.
+
+        Parameters
+        ----------
+        cotangents : dict
+            Dictionary of cotangent fields.
+        id : uuid.UUID, optional
+            ID for caching evaluation.
+        subproblems : Subproblem object or list of Subproblem objects, optional
+            Subproblems for which to compute sensitivities (default: None (all)).
+
+        Returns
+        -------
+        cotangents : dict
+            Dictionary of cotangent fields.
+        """
+        # Retrieve or allocate adjoint fields for adjoint state solve
+        H = build_cotangent_list(self.state, cotangents)
+        # Solve adjoint state equation: L.H @ Y = H
+        Y = self.solve_adjoint(H, subproblems=subproblems)
+        # Negate adjoint values before VJP
+        for Yi in Y:
+            Yi.data *= -1
+        # Accumulate sensitivities from residual expressions R = L @ X - F
+        # TODO: store expression list for reevaluation
+        expressions = []
+        for i, eqn in enumerate(self.problem.equations):
+            R = eqn['R']
+            if isinstance(R, Field):
+                # Here R=X in the state, need to accumulate Y[i]
+                raise ValueError("Not implemented")
+            else:
+                expressions.append(R)
+                cotangents[R] = Y[i]
+        expressions = ExpressionList(self.evaluator, expressions)
+        # Default to uuid to cache within evaluation, but not across evaluations
+        if id is None:
+            id = uuid.uuid4()
+        _, cotangents = expressions.evaluate_vjp(cotangents, id=id, force=True)
+        return cotangents
 
 
 class NonlinearBoundaryValueSolver(SolverBase):
@@ -498,6 +639,84 @@ class NonlinearBoundaryValueSolver(SolverBase):
         if handlers is None:
             handlers = self.evaluator.handlers
         self.evaluator.evaluate_handlers(handlers, iteration=self.iteration)
+
+    def solve_adjoint(self, H, rebuild_matrices=False):
+        """
+        Solve adjoint BVP over selected subproblems.
+
+        Parameters
+        ----------
+        H : list of cotangent fields
+            RHS for adjoint state equation, one cotangent field for each state variable.
+        rebuild_matrices : bool, optional
+            Rebuild Jacobians instead of using Jacobians from last iteration (default: False).
+        """
+        # Evaluate RHS of adjoint state equation
+        # TODO: see if an evaluator for these is worthwhile
+        H = [Hi.evaluate() for Hi in H]
+        # Allocate adjoint state fields
+        Y = build_cotangent_list(self.F, {})
+        # Ensure coeff space before subsystem gathers/scatters
+        for field in H:
+            field.change_layout('c')
+        for field in Y:
+            field.preset_layout('c')
+        # Rebuild Jacobians if required
+        if rebuild_matrices:
+            self.build_matrices(self.subproblems, ['dF'])
+        # Solve adjoint state equation for each subproblem
+        for sp in self.subproblems:
+            # Gather RHS (includes adjoint of right preconditioner)
+            H_sp = sp.gather_inputs(H)
+            # Adjoint solve
+            sp_matsolver = self.matsolver(sp.dF_min, self)
+            Y_sp = sp_matsolver.solve_H(H_sp) # CREATES TEMPORARY
+            # Scatter state (contains adjoint of left preconditioner)
+            sp.scatter_outputs(Y_sp, Y)
+        return Y
+
+    def compute_sensitivities(self, cotangents, rebuild_matrices=False, id=None):
+        """
+        Propagate cotangents through BVP via adjoint solution.
+
+        Parameters
+        ----------
+        cotangents : dict
+            Dictionary of cotangent fields.
+        rebuild_matrices : bool, optional
+            Rebuild Jacobians instead of using Jacobians from last iteration (default: False).
+        id : uuid.UUID, optional
+            ID for caching evaluation.
+
+        Returns
+        -------
+        cotangents : dict
+            Dictionary of cotangent fields.
+        """
+        # Retrieve or allocate adjoint fields for adjoint state solve
+        H = build_cotangent_list(self.state, cotangents)
+        # Solve adjoint state equation: dF.H @ Y = H
+        Y = self.solve_adjoint(H, rebuild_matrices=rebuild_matrices)
+        # Negate adjoint values before VJP
+        for Yi in Y:
+            Yi.data *= -1
+        # Accumulate sensitivities from residual expressions R = F
+        # TODO: store expression list for reevaluation
+        expressions = []
+        for i, eqn in enumerate(self.problem.equations):
+            R = eqn['F']
+            if isinstance(R, Field):
+                # Here R=X in the state, need to accumulate Y[i]
+                raise ValueError("Not implemented")
+            else:
+                expressions.append(R)
+                cotangents[R] = Y[i]
+        expressions = ExpressionList(self.evaluator, expressions)
+        # Default to uuid to cache within evaluation, but not across evaluations
+        if id is None:
+            id = uuid.uuid4()
+        _, cotangents = expressions.evaluate_vjp(cotangents, id=id, force=True)
+        return cotangents
 
 
 class InitialValueSolver(SolverBase):
@@ -588,6 +807,8 @@ class InitialValueSolver(SolverBase):
         self.stop_sim_time = np.inf
         self.stop_wall_time = np.inf
         self.stop_iteration = np.inf
+        # For adjoint
+        self.adjoint_state = []
         logger.debug('Finished IVP instantiation')
 
     @property
@@ -710,7 +931,34 @@ class InitialValueSolver(SolverBase):
         self.iteration += 1
         self.dt = dt
 
-    def evolve(self, timestep_function, log_cadence=100):
+    def reset(self, iter=0):
+        """Reset solver so that it can be reused"""
+        self.iteration = iter
+        self.evaluator.handlers[0].last_iter_div = iter-1
+        # TODO: Fix this for checkpointing
+        self.sim_time = self.problem.time['g'] = self.initial_sim_time
+        # reset timestepper
+        self.timestepper.reset()
+
+    def step_adjoint(self, dt, cotangents):
+        """Advance system by one iteration/timestep."""
+        # Enforce Hermitian symmetry for real variables
+        if np.isrealobj(self.dtype.type()):
+            # Enforce for as many iterations as timestepper uses internally
+            if self.iteration % self.enforce_real_cadence < self.timestepper.steps:
+                self.enforce_hermitian_symmetry(self.state)
+        # Record times
+        wall_time = self.wall_time
+        # Advance using timestepper
+        if self.iteration == self.stop_iteration:
+            self.adjoint_start_time = wall_time
+        wall_elapsed = wall_time - self.adjoint_start_time
+        self.timestepper.step_adjoint(dt, wall_elapsed, cotangents)
+        # Update iteration
+        self.iteration -= 1
+        self.dt = dt # Needed?
+
+    def evolve(self, timestep_function, checkpoints={}, log_cadence=100):
         """Advance system until stopping criterion is reached."""
         # Check for a stopping criterion
         if np.isinf(self.stop_sim_time):
@@ -721,6 +969,9 @@ class InitialValueSolver(SolverBase):
         try:
             logger.info("Starting main loop")
             while self.proceed:
+                for state in self.state:
+                    if state in checkpoints:
+                        checkpoints[state].append(state['c'].copy())
                 timestep = timestep_function()
                 self.step(timestep)
                 if (self .iteration-1) % log_cadence == 0:
@@ -730,6 +981,36 @@ class InitialValueSolver(SolverBase):
             raise
         finally:
             self.log_stats()
+
+    def compute_sensitivities(self, cotangents, checkpoints={}, timestep_function=None, log_cadence=100):
+        """Accumulate cotangents through an IVP solve"""
+        # Allocate adjoint fields
+        for state in self.state:
+            if state not in cotangents:
+                adjoint_state = state.get_cotangent()
+                adjoint_state.preset_layout('c')
+                adjoint_state.data.fill(0)
+                cotangents[state] = adjoint_state
+        # Evolve adjoint backwards
+        try:
+            while self.iteration>0:
+                if checkpoints is not None:
+                    for state in self.state:
+                        if state in checkpoints:
+                            state['c'] = checkpoints[state][self.iteration-1]
+                if timestep_function is not None:
+                    timestep = timestep_function()
+                else:
+                    timestep = None
+                self.step_adjoint(timestep, cotangents)
+                if (self.iteration-1) % log_cadence == 0:
+                    logger.info(f"Adjoint: Iteration={self.iteration}, Time={self.sim_time:e}")
+        except:
+            logger.error('Exception raised, triggering end of adjoint loop.')
+            raise
+        finally:
+            self.log_stats_adjoint()
+        return cotangents
 
     def print_subproblem_ranks(self, subproblems=None, dt=1):
         """Print rank of each subproblem LHS."""
@@ -776,6 +1057,19 @@ class InitialValueSolver(SolverBase):
             logger.info(f"Speed: {(modes*stages/cpus/run_time):{format}} mode-stages/cpu-sec")
         else:
             logger.info(f"Timings unavailable because warmup did not complete.")
+
+    def log_stats_adjoint(self, format=".4g"):
+        """Log timing statistics for the adjoint solve with specified string formatting (optional)."""
+        self.run_time_end = self.wall_time
+        run_time = self.run_time_end - self.adjoint_start_time
+        cpus = self.dist.comm.size
+        modes = self.total_modes
+        stages = (self.stop_iteration - self.initial_iteration) * self.timestepper.stages
+        logger.info(f"Final iteration: {self.iteration}")
+        logger.info(f"Final sim time: {self.sim_time}")
+        logger.info(f"Run time (iter end-{self.initial_iteration}): {run_time:{format}} sec")
+        logger.info(f"CPU time (iter end-{self.initial_iteration}): {run_time*cpus/3600:{format}} cpu-hr")
+        logger.info(f"Speed: {(modes*stages/cpus/run_time):{format}} mode-stages/cpu-sec")
 
     def dump_profiles(self, profiler, name):
         "Save profiling data to disk."

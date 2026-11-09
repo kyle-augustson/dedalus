@@ -313,7 +313,7 @@ class Power(NonlinearOperator, metaclass=MultiClass):
 
     @classmethod
     def _preprocess_args(cls, *args, **kw):
-        domain = unify_attributes(args, 'domain', require=False)
+        domain = unify_attributes(args, 'dist', require=False)
         #args = tuple(Operand.cast(arg, domain) for arg in args)
         return args, kw
 
@@ -323,14 +323,15 @@ class Power(NonlinearOperator, metaclass=MultiClass):
         #arg1_constant = all(b is None for b in args[1].bases)
         return all(match) #(all(match) and arg1_constant)
 
-    @property
-    def base(self):
-        return Power
+    def new_operands(self, arg0, arg1, **kw):
+        return Power(arg0, arg1)
 
-    def sym_diff(self, var):
-        """Symbolically differentiate with respect to specified operand."""
-        base, power = self.args
-        return power * base**(power-1) * base.sym_diff(var)
+    def require_first_order(self, *ops, **kw):
+        """Require expression to be maximally first order in specified operators."""
+        arg0 = self.args[0]
+        if arg0.has(*ops):
+            raise NonlinearOperatorError("This should never happen.")
+        #arg0.require_first_order(*ops, **kw)
 
 
 class PowerFieldConstant(Power, FutureField):
@@ -348,6 +349,8 @@ class PowerFieldConstant(Power, FutureField):
 
     def __init__(self, arg0, arg1, out=None):
         super().__init__(arg0, arg1, out=out)
+        if arg0.tensorsig:
+            raise ValueError("Power not defined for non-scalar fields.")
         self.domain = arg0.domain
         self.tensorsig = arg0.tensorsig
         self.dtype = arg0.dtype
@@ -376,26 +379,194 @@ class PowerFieldConstant(Power, FutureField):
         #     arg0.require_grid_space(axis=axis)
         # arg1.change_layout(arg0.layout)
         arg0.require_grid_space()
+        return self.dist.grid_layout
 
     def operate(self, out):
         arg0, arg1 = self.args
-        # Multiply in grid layout
         out.preset_layout(arg0.layout)
         if out.data.size:
             np.power(arg0.data, arg1, out.data)
 
-    def new_operands(self, arg0, arg1, **kw):
-        return Power(arg0, arg1)
+    def operate_jvp(self, out, tangent):
+        arg0, arg1 = self.args
+        out.preset_layout(arg0.layout)
+        if out.data.size:
+            np.power(arg0.data, arg1, out=out.data)
+            if tangent:
+                tan0, tan1 = self.arg_tangents
+                tangent.preset_layout(tan0.layout)
+                np.power(arg0.data, arg1-1, out=tangent.data)
+                np.multiply(tangent.data, arg1, out=tangent.data)
+                np.multiply(tangent.data, tan0.data, out=tangent.data)
+
+    def operate_vjp(self, layout, cotangents):
+        arg0, arg1 = self.args
+        orig_arg0 = self.original_args[0]
+        if isinstance(orig_arg0, Future):
+            orig_arg0.cotangent.change_layout(layout)
+            cotan0 = orig_arg0.cotangent
+        else:
+            if arg0 not in cotangents:
+                cotan0 = arg0.copy()
+                cotan0.adjoint = True
+                cotan0.data.fill(0)
+                cotangents[arg0] = cotan0
+            else:
+                cotan0 = cotangents[arg0]
+                cotan0.change_layout(layout)
+        # Add adjoint contribution in-place (required for accumulation)
+        self.cotangent.change_layout(layout)
+        if self.cotangent.data.size:
+            # TODO: optimize with axpy
+            temp = np.conj(arg1 * arg0.data ** (arg1-1)) * self.cotangent.data
+            np.add(cotan0.data, temp, out=cotan0.data)
 
     def reinitialize(self, **kw):
         arg0 = self.args[0].reinitialize(**kw)
         arg1 = self.args[1]
         return self.new_operands(arg0, arg1, **kw)
 
-    def require_first_order(self, *ops, **kw):
-        """Require expression to be maximally first order in specified operators."""
-        arg0 = self.args[0]
-        arg0.require_first_order(*ops, **kw)
+    def sym_diff(self, var):
+        """Symbolically differentiate with respect to specified operand."""
+        arg0, arg1 = self.args
+        return arg1 * arg0**(arg1-1) * arg0.sym_diff(var)
+
+
+class PowerFieldField(Power, FutureField):
+
+    argtypes = {0: (Field, FutureField),
+                1: (Field, FutureField,)}
+
+    def __init__(self, arg0, arg1, out=None):
+        super().__init__(arg0, arg1, out=out)
+        if arg0.tensorsig or arg1.tensorsig:
+            raise ValueError("Power not defined for non-scalar fields.")
+        self.domain = Domain(self.dist, self._build_bases(arg0, arg1))
+        self.tensorsig = arg0.tensorsig
+        self.dtype = arg0.dtype
+        # Setup ghost broadcasting
+        from .arithmetic import GhostBroadcaster
+        broadcast_dims = np.array(self.domain.nonconstant)
+        self.arg0_ghost_broadcaster = GhostBroadcaster(arg0.domain, self.dist.grid_layout, broadcast_dims)
+        self.arg1_ghost_broadcaster = GhostBroadcaster(arg1.domain, self.dist.grid_layout, broadcast_dims)
+
+    def _build_bases(self, arg0, arg1):
+        """Build output bases."""
+        bases = []
+        arg0_bases = arg0.domain.bases_by_coord
+        arg1_bases = arg1.domain.bases_by_coord
+        for coord in arg0_bases:
+            b0 = arg0_bases[coord]
+            b1 = arg1_bases[coord]
+            # All constant bases yields constant basis
+            if b0 is None and b1 is None:
+                continue
+            # Multiply all bases
+            bases.append(b0 * b1)
+        return tuple(bases)
+
+    def check_conditions(self):
+        layout0 = self.args[0].layout
+        layout1 = self.args[1].layout
+        return all(layout0.grid_space) and (layout0 is layout1)
+
+    def enforce_conditions(self):
+        arg0, arg1 = self.args
+        arg0.require_grid_space()
+        arg1.require_grid_space()
+        return self.dist.grid_layout
+
+    def operate(self, out):
+        arg0, arg1 = self.args
+        out.preset_layout(arg0.layout)
+        if out.data.size:
+            arg0_data = self.arg0_ghost_broadcaster.cast(arg0)
+            arg1_data = self.arg1_ghost_broadcaster.cast(arg1)
+            np.power(arg0_data, arg1_data, out.data)
+
+    def operate_jvp(self, out, tangent):
+        arg0, arg1 = self.args
+        out.preset_layout(arg0.layout)
+        if out.data.size:
+            arg0_data = self.arg0_ghost_broadcaster.cast(arg0)
+            arg1_data = self.arg1_ghost_broadcaster.cast(arg1)
+            np.power(arg0_data, arg1_data, out=out.data)
+            if tangent:
+                tan0, tan1 = self.arg_tangents
+                # One of tan0 or tan1 may be None
+                # tangent has same layout as arg0 (not None)
+                tangent.preset_layout(arg0.layout)
+                if tan0 is None:
+                    tan1_data = self.arg1_ghost_broadcaster.cast(tan1)
+                    tangent.data[:] = out.data * np.log(arg0_data) * tan1_data
+                elif tan1 is None:
+                    tan0_data = self.arg0_ghost_broadcaster.cast(tan0)
+                    tangent.data[:] = arg1_data * arg0_data**(arg1_data-1) * tan0_data
+                else:
+                    tan0_data = self.arg0_ghost_broadcaster.cast(tan0)
+                    tan1_data = self.arg1_ghost_broadcaster.cast(tan1)
+                    tangent.data[:] = arg1_data * arg0_data**(arg1_data-1) * tan0_data + out.data * np.log(arg0_data) * tan1_data
+
+    def operate_vjp(self, layout, cotangents):
+        arg0, arg1 = self.args
+        orig_arg0, orig_arg1 = self.original_args
+        if isinstance(orig_arg0, Future):
+            orig_arg0.cotangent.change_layout(layout)
+            cotan0 = orig_arg0.cotangent
+        else:
+            if arg0 not in cotangents:
+                cotan0 = arg0.copy()
+                cotan0.adjoint = True
+                cotan0.data.fill(0)
+                cotangents[arg0] = cotan0
+            else:
+                cotan0 = cotangents[arg0]
+                cotan0.change_layout(layout)
+        if isinstance(orig_arg1, Future):
+            orig_arg1.cotangent.change_layout(layout)
+            cotan1 = orig_arg1.cotangent
+        else:
+            if arg1 not in cotangents:
+                cotan1 = arg1.copy()
+                cotan1.adjoint = True
+                cotan1.data.fill(0)
+                cotangents[arg1] = cotan1
+            else:
+                cotan1 = cotangents[arg1]
+                cotan1.change_layout(layout)
+        # Add adjoint contribution in-place (required for accumulation)
+        self.cotangent.change_layout(layout)
+        if self.cotangent.data.size:
+            # TODO: optimize with axpy
+            arg0_data = self.arg0_ghost_broadcaster.cast(arg0)
+            arg1_data = self.arg1_ghost_broadcaster.cast(arg1)
+            # Compute raw cotangents
+            temp0 = np.conj(arg1_data * arg0_data ** (arg1_data-1)) * self.cotangent.data
+            temp1 = np.conj(arg0_data ** arg1_data * np.log(arg0_data)) * self.cotangent.data
+            # Reduce over broadcasted spatial dimensions
+            spatial_reduce_0 = self.arg0_ghost_broadcaster.deploy_dims_ext_list
+            spatial_reduce_1 = self.arg1_ghost_broadcaster.deploy_dims_ext_list
+            temp0 = temp0.sum(axis=spatial_reduce_0, keepdims=True)
+            temp1 = temp1.sum(axis=spatial_reduce_1, keepdims=True)
+            # Reduce over broadcasted processes
+            temp0 = self.arg0_ghost_broadcaster.reduce(temp0)
+            temp1 = self.arg1_ghost_broadcaster.reduce(temp1)
+            # Add adjoint contribution in-place (required for accumulation)
+            # NOTE: this probably doesnt work under MPI because the reduced data
+            # still has the broadcasted, rather than field, shape
+            np.add(cotan0.data, temp0, out=cotan0.data)
+            np.add(cotan1.data, temp1, out=cotan1.data)
+
+    def reinitialize(self, **kw):
+        arg0 = self.args[0].reinitialize(**kw)
+        arg1 = self.args[1].reinitialize(**kw)
+        return self.new_operands(arg0, arg1, **kw)
+
+    def sym_diff(self, var):
+        """Symbolically differentiate with respect to specified operand."""
+        arg0, arg1 = self.args
+        return arg1 * arg0**(arg1-1) * arg0.sym_diff(var) + self * np.log(arg0) * arg1.sym_diff(var)
+
 
 # class PowerArrayScalar(PowerDataScalar, FutureArray):
 
@@ -604,6 +775,7 @@ class UnaryGridFunction(NonlinearOperator, FutureField):
 
     def enforce_conditions(self):
         self.args[0].require_grid_space()
+        return self.dist.grid_layout
 
     def operate(self, out):
         # References
@@ -612,6 +784,35 @@ class UnaryGridFunction(NonlinearOperator, FutureField):
         out.preset_layout(self._grid_layout)
         self.func(arg0.data, out=out.data)
 
+    def operate_jvp(self, out, tangent):
+        arg0, = self.args
+        out.preset_layout(self._grid_layout)
+        self.func(arg0.data, out=out.data)
+        if tangent:
+            tan0, = self.arg_tangents
+            tangent.preset_layout(self._grid_layout)
+            np.multiply(self.ufunc_derivatives[self.func](arg0.data), tan0.data, out=tangent.data)
+
+    def operate_vjp(self, layout, cotangents):
+        arg0, = self.args
+        orig_arg0 = self.original_args[0]
+        if isinstance(orig_arg0, Future):
+            orig_arg0.cotangent.change_layout(layout)
+            cotan0 = orig_arg0.cotangent
+        else:
+            if arg0 not in cotangents:
+                cotan0 = arg0.copy()
+                cotan0.adjoint = True
+                cotan0.data.fill(0)
+                cotangents[arg0] = cotan0
+            else:
+                cotan0 = cotangents[arg0]
+                cotan0.change_layout(layout)
+        # Add adjoint contribution in-place (required for accumulation)
+        self.cotangent.change_layout(layout)
+        temp = np.conj(self.ufunc_derivatives[self.func](arg0.data))*self.cotangent.data
+        # TODO: optimize with axpy
+        np.add(cotan0.data, temp, out=cotan0.data)
 
 class LinearOperator(FutureField):
     """
@@ -796,6 +997,44 @@ class LinearOperator(FutureField):
     def subproblem_matrix(self, subproblem):
         """Build operator matrix for a specific subproblem."""
         raise NotImplementedError("%s has not implemented a subproblem_matrix method." %type(self))
+
+    def _operate(self, args, out, adjoint=False):
+        raise NotImplementedError("%s has not implemented an _operate method." %type(self))
+
+    def operate(self, out):
+        out.preset_layout(self.args[0].layout)
+        self._operate(self.args, out)
+
+    def operate_jvp(self, out, tangent):
+        out.preset_layout(self.args[0].layout)
+        tangent.preset_layout(self.arg_tangents[0].layout)
+        self._operate(self.args, out)
+        self._operate(self.arg_tangents, tangent)
+
+    def operate_vjp(self, layout, cotangents):
+        # TODO: fix this hack, which avoids return layouts from all enforce_conditions methods
+        if layout is None:
+            layout = self.args[0].layout
+        orig_args = self.original_args
+        args = self.args
+        arg_cotangents = []
+        for arg, orig_arg in zip(args, orig_args):
+            if isinstance(orig_arg, Future):
+                arg_cotangent = orig_arg.cotangent
+            else:
+                if arg not in cotangents:
+                    arg_cotangent = arg.copy()
+                    arg_cotangent.adjoint = True
+                    arg_cotangent.data.fill(0)
+                    cotangents[arg] = arg_cotangent
+                else:
+                    arg_cotangent = cotangents[arg]
+            arg_cotangents.append(arg_cotangent)
+        for arg_cotangent in arg_cotangents:
+            arg_cotangent.change_layout(layout)
+        out_cotangent = self.cotangent
+        out_cotangent.change_layout(layout)
+        self._operate(arg_cotangents, out_cotangent, adjoint=True) # note order (adjoint of forward operator)
 
 
 class Lock(FutureLockedField, LinearOperator):
@@ -995,16 +1234,22 @@ class SpectralOperator1D(SpectralOperator):
     def _group_matrix(group, input_basis, output_basis, *args):
         raise NotImplementedError()
 
-    def operate(self, out):
-        """Perform operation."""
-        arg = self.args[0]
+    def _operate(self, args, out, adjoint=False):
+        """Perform operation on generic argument."""
+        arg = args[0]
         layout = arg.layout
-        # Set output layout
-        out.preset_layout(layout)
         # Apply matrix
         if arg.data.size and out.data.size:
-            data_axis = self.last_axis + len(arg.tensorsig)
-            apply_matrix(self.subspace_matrix(layout), arg.data, data_axis, out=out.data)
+            if adjoint:
+                # arg += adjoint(matrix) @ out
+                data_axis = self.last_axis + len(out.tensorsig)
+                apply_matrix(self.subspace_matrix(layout), out.data, data_axis, out=arg.data, overwrite_out=False, adjoint=True)
+            else:
+                # out = matrix @ arg
+                data_axis = self.last_axis + len(arg.tensorsig)
+                apply_matrix(self.subspace_matrix(layout), arg.data, data_axis, out=out.data)
+        elif adjoint:
+            pass # accumulating with zero
         else:
             out.data.fill(0)
 
@@ -1537,11 +1782,13 @@ class Copy(LinearOperator):
         size = subproblem.field_size(self.operand)
         return sparse.identity(size, format='csr')
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        arg = self.args[0]
-        out.preset_layout(arg.layout)
-        np.copyto(out.data, arg.data)
+        arg = args[0]
+        if adjoint:
+            np.add(out.data, arg.data, out=arg.data)
+        else:
+            np.copyto(out.data, arg.data)
 
 
 class Convert(SpectralOperator, metaclass=MultiClass):
@@ -1644,17 +1891,19 @@ class Convert(SpectralOperator, metaclass=MultiClass):
         """Build matrix operating on global subspace data."""
         return self._subspace_matrix(layout, self.input_basis, self.output_basis, self.first_axis)
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        arg = self.args[0]
+        arg = args[0]
         layout = arg.layout
         # Copy for grid space
         if layout.grid_space[self.last_axis]:
-            out.preset_layout(layout)
-            np.copyto(out.data, arg.data)
+            if adjoint:
+                np.add(arg.data, out.data, out=arg.data)
+            else:
+                np.copyto(out.data, arg.data)
         # Revert to matrix application for coeff space
         else:
-            super().operate(out)
+            super()._operate(args, out, adjoint=adjoint)
 
 
 class ConvertSame(Convert):
@@ -1734,6 +1983,25 @@ class ConvertConstant(Convert):
             # Require last axis in coeff space
             arg0.require_coeff_space(self.last_axis)
 
+    def _operate(self, args, out, adjoint=False):
+        """Perform operation."""
+        arg = args[0]
+        layout = arg.layout
+        # Copy for grid space
+        # Should only happen for 1D bases with the axis local
+        if layout.grid_space[self.last_axis]:
+            if adjoint:
+                # Accumulate out.data into arg.data (axis is required to be local)
+                axis = self.last_axis + len(arg.tensorsig)
+                reduction = np.sum(out.data, axis=axis, keepdims=True) # CREATES TEMPORARY
+                np.add(arg.data, reduction, out=arg.data)
+            else:
+                # Broadcasts across grid data (axis is required to be local)
+                np.copyto(out.data, arg.data)
+        # Revert to matrix application for coeff space
+        else:
+            super()._operate(args, out, adjoint=adjoint)
+
 
 @alias("trace")
 class Trace(LinearOperator, metaclass=MultiClass):
@@ -1792,11 +2060,15 @@ class Trace(LinearOperator, metaclass=MultiClass):
     def base(self):
         return Trace
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        arg = self.args[0]
-        out.preset_layout(arg.layout)
-        np.einsum('ii...', arg.data, out=out.data)
+        arg = args[0]
+        if adjoint:
+            # Add out.data to diagonal of arg.data
+            # (einsum returns a view of the diagonal)
+            np.einsum('ii...->i...', arg.data)[:] += out.data
+        else:
+            np.einsum('ii...', arg.data, out=out.data)
 
 
 class SphericalTrace(Trace):
@@ -1991,13 +2263,15 @@ class StandardTransposeComponents(TransposeComponents):
         eye = sparse.identity(subproblem.coeff_size(self.domain), self.dtype, format='csr')
         return sparse.kron(transpose, eye)
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        operand = self.args[0]
-        # Set output layout
-        out.preset_layout(operand.layout)
-        # Transpose data
-        out.data[:] = np.transpose(operand.data, self.new_axis_order)  # CREATES TEMPORARY
+        arg = args[0]
+        if adjoint:
+            # Transpose data and accumulate
+            arg.data[:] += np.transpose(out.data, self.new_axis_order)  # CREATES TEMPORARY
+        else:
+            # Transpose data
+            out.data[:] = np.transpose(arg.data, self.new_axis_order)  # CREATES TEMPORARY
 
 
 class SphericalTransposeComponents(TransposeComponents):
@@ -2041,27 +2315,39 @@ class SphericalTransposeComponents(TransposeComponents):
         matrix = sparse.kron(transpose, eye)
         return matrix
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        operand = self.args[0]
+        arg = args[0]
         radius_axis = self.radius_axis
-        # Set output layout
-        layout = operand.layout
-        out.preset_layout(layout)
-        # Transpose data
-        if layout.grid_space[radius_axis]:
-            # Not in regularity components: can directly transpose
-            out.data[:] = np.transpose(operand.data, self.new_axis_order)
+        layout = out.layout if adjoint else arg.layout
+        if adjoint:
+            inverse_order = np.argsort(self.new_axis_order)
+            if layout.grid_space[radius_axis]:
+                # Not in regularity components: can directly transpose back and accumulate
+                arg.data[:] += np.transpose(out.data, inverse_order)
+            else:
+                radial_basis = self.radial_basis
+                ell_maps = self.input_basis.ell_maps(self.dist)
+                # Adjoint of the forward steps in reverse order, in place on the output cotangent:
+                # the recombinations swap direction and signature, and the transposition is inverted
+                radial_basis.backward_regularity_recombination(self.tensorsig, radius_axis, out.data, ell_maps=ell_maps)
+                copyto(out.data, np.transpose(out.data, inverse_order))
+                radial_basis.forward_regularity_recombination(arg.tensorsig, radius_axis, out.data, ell_maps=ell_maps)
+                # Accumulate into the input cotangent
+                arg.data[:] += out.data
         else:
-            radial_basis = self.radial_basis
-            ell_maps = self.input_basis.ell_maps(self.dist)
-            # Copy to output for in-place regularity recombination
-            copyto(out.data, operand.data)
-            out.data[:] = operand.data
-            # Commute transposition with regularity recombination
-            radial_basis.backward_regularity_recombination(operand.tensorsig, radius_axis, out.data, ell_maps=ell_maps)
-            copyto(out.data, np.transpose(out.data, self.new_axis_order))
-            radial_basis.forward_regularity_recombination(operand.tensorsig, radius_axis, out.data, ell_maps=ell_maps)
+            if layout.grid_space[radius_axis]:
+                # Not in regularity components: can directly transpose
+                out.data[:] = np.transpose(arg.data, self.new_axis_order)
+            else:
+                radial_basis = self.radial_basis
+                ell_maps = self.input_basis.ell_maps(self.dist)
+                # Copy to output for in-place regularity recombination
+                copyto(out.data, arg.data)
+                # Commute transposition with regularity recombination
+                radial_basis.backward_regularity_recombination(arg.tensorsig, radius_axis, out.data, ell_maps=ell_maps)
+                copyto(out.data, np.transpose(out.data, self.new_axis_order))
+                radial_basis.forward_regularity_recombination(arg.tensorsig, radius_axis, out.data, ell_maps=ell_maps)
 
 
 @alias("skew")
@@ -2128,17 +2414,22 @@ class CartesianSkew(Skew):
         factors[self.index] = skew
         return reduce(sparse.kron, factors, 1).tocsr()
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        arg = self.args[0]
-        # Set output layout
-        out.preset_layout(arg.layout)
-        # Skew data
-        if arg.data.size:
+        arg = args[0]
+        if adjoint:
+            # Skew and accumulate data
             sx = axslice(self.index, 0, 1)
             sy = axslice(self.index, 1, 2)
-            out.data[sx] = - arg.data[sy]
-            out.data[sy] = arg.data[sx]
+            arg.data[sx] += out.data[sy]
+            arg.data[sy] -= out.data[sx]
+        else:
+            # Skew data
+            if arg.data.size:
+                sx = axslice(self.index, 0, 1)
+                sy = axslice(self.index, 1, 2)
+                out.data[sx] = - arg.data[sy]
+                out.data[sy] = arg.data[sx]
 
 
 class SpinSkew(Skew):
@@ -2167,22 +2458,24 @@ class SpinSkew(Skew):
             factors[azimuth_index] = sparse.kron(id_m, mul_1j)
         return reduce(sparse.kron, factors, 1).tocsr()
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        arg = self.args[0]
+        arg = args[0]
         index = self.index
         azimuth_axis = self.azimuth_axis
         rank = len(self.tensorsig)
-        # Set output layout
-        out.preset_layout(arg.layout)
         # Apply skew
         if arg.data.size:
             if arg.layout.grid_space[azimuth_axis+1]:
                 # Left handed
                 sx = axslice(self.index, 0, 1)
                 sy = axslice(self.index, 1, 2)
-                out.data[sx] = arg.data[sy]
-                np.multiply(arg.data[sx], -1, out=out.data[sy])
+                if adjoint:
+                    arg.data[sx] -= out.data[sy]
+                    arg.data[sy] += out.data[sx]
+                else:
+                    out.data[sx] = arg.data[sy]
+                    np.multiply(arg.data[sx], -1, out=out.data[sy])
             else:
                 # Spinorder: -, +
                 minus = axslice(index, 0, 1)
@@ -2192,18 +2485,28 @@ class SpinSkew(Skew):
                 out_plus = out.data[plus]
                 out_minus = out.data[minus]
                 if is_complex_dtype(self.dtype):
-                    # out = 1j * s * arg
-                    np.multiply(arg_plus, 1j, out=out_plus)
-                    np.multiply(arg_minus, -1j, out=out_minus)
+                    if adjoint:
+                        arg_plus += np.multiply(out_plus, -1j) # TEMPORARY
+                        arg_minus += np.multiply(out_minus, 1j) # TEMPORARY
+                    else:
+                        # out = 1j * s * arg
+                        np.multiply(arg_plus, 1j, out=out_plus)
+                        np.multiply(arg_minus, -1j, out=out_minus)
                 else:
                     # out_cos + 1j * out_msin = (1j * s) * (arg_cos + 1j * arg_msin)
                     #                         = - s * arg_msin +  1j * s * arg_cos
                     cos = axslice(rank+azimuth_axis, 0, None, 2)
                     msin = axslice(rank+azimuth_axis, 1, None, 2)
-                    np.multiply(arg_plus[msin], -1, out=out_plus[cos])
-                    copyto(out_plus[msin], arg_plus[cos])
-                    copyto(out_minus[cos], arg_minus[msin])
-                    np.multiply(arg_minus[cos], -1, out=out_minus[msin])
+                    if adjoint:
+                        arg_plus[msin] -= out_plus[cos]
+                        arg_plus[cos] += out_plus[msin]
+                        arg_minus[msin] += out_minus[cos]
+                        arg_minus[cos] -= out_minus[msin]
+                    else:
+                        np.multiply(arg_plus[msin], -1, out=out_plus[cos])
+                        copyto(out_plus[msin], arg_plus[cos])
+                        copyto(out_minus[cos], arg_minus[msin])
+                        np.multiply(arg_minus[cos], -1, out=out_minus[msin])
 
 
 class Component(LinearOperator):
@@ -2416,18 +2719,15 @@ class CartesianGradient(Gradient):
             if arg:
                 arg.change_layout(layout)
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        operands = self.args
-        layouts = [operand.layout for operand in self.args if operand]
-        # Set output layout
-        out.preset_layout(layouts[0])
-        # Copy operand data to output components
-        for i, comp in enumerate(operands):
-            if comp:
-                out.data[i] = comp.data
+        # Copy arg data to output components
+        for i, arg_i in enumerate(args):
+            if adjoint:
+                # Add instead of copy for VJP accumulation
+                np.add(arg_i.data, out.data[i], out=arg_i.data)
             else:
-                out.data[i] = 0
+                copyto(out.data[i], arg_i.data)
 
 
 class DirectProductGradient(Gradient):
@@ -2820,31 +3120,31 @@ class SeparableSphereOperator(SpectralOperator):
         matrix = sparse.bmat(blocks)
         return matrix.tocsr()
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        operand = self.args[0]
-        layout = operand.layout
+        # TODO: check if its faster to make dense matrices of symbols across all components
+        arg = args[0]
+        layout = arg.layout
         basis = self.input_basis
         if basis is None:
             basis = self.output_basis
-        # Set output layout
-        out.preset_layout(layout)
-        out.data[:] = 0
+        if not adjoint:
+            out.data[:] = 0
         # Return for size-zero data
-        if operand.data.size == 0 or out.data.size == 0:
+        if arg.data.size == 0 or out.data.size == 0:
             return
         # Select overlapping data if necessary
-        rank_in = len(operand.tensorsig)
+        rank_in = len(arg.tensorsig)
         rank_out = len(out.tensorsig)
-        local_shape_in = operand.data.shape[rank_in:]
+        local_shape_in = arg.data.shape[rank_in:]
         local_shape_out = out.data.shape[rank_out:]
         if local_shape_in == local_shape_out:
             slices = None
-            data_in = operand.data
+            data_in = arg.data
             data_out = out.data
         else:
             slices = tuple(slice(n) for n in np.minimum(local_shape_in, local_shape_out))
-            data_in = operand.data[slices]
+            data_in = arg.data[slices]
             data_out = out.data[slices]
         # Prepare complexification if necessary
         complexify = (self.complex_operator and np.isrealobj(self.dtype()))
@@ -2855,7 +3155,7 @@ class SeparableSphereOperator(SpectralOperator):
             data_out_cos = data_out[axslice(rank_out+azimuth_axis, 0, None, 2)]
             data_out_msin = data_out[axslice(rank_out+azimuth_axis, 1, None, 2)]
         # Apply operator
-        S_in = basis.spin_weights(operand.tensorsig)
+        S_in = basis.spin_weights(arg.tensorsig)
         for spinindex_in, spintotal_in in np.ndenumerate(S_in):
             if complexify:
                 comp_in_cos = data_in_cos[spinindex_in]
@@ -2869,19 +3169,30 @@ class SeparableSphereOperator(SpectralOperator):
                 symbols = self.local_symbols(layout, spinindex_in, spinindex_out, spintotal_in, spintotal_out)
                 if slices and not np.isscalar(symbols):
                     symbols = symbols[slices]
+                if adjoint:
+                    symbols = np.conj(symbols)
                 # Multiply by symbols
                 if complexify:
+                    comp_out_cos = data_out_cos[spinindex_out]
+                    comp_out_msin = data_out_msin[spinindex_out]
                     # Skip repeated symbols
                     if not np.isscalar(symbols):
                         symbols = symbols[::2]
-                    comp_out_complex = symbols * comp_in_complex # TEMPORARY
-                    comp_out_cos = data_out_cos[spinindex_out]
-                    comp_out_msin = data_out_msin[spinindex_out]
-                    comp_out_cos += comp_out_complex.real
-                    comp_out_msin += comp_out_complex.imag
+                    if adjoint:
+                        comp_out_complex = comp_out_cos + 1j * comp_out_msin  # TEMPORARY
+                        comp_in_complex = np.conj(symbols) * comp_out_complex  # TEMPORARY
+                        comp_in_cos += comp_in_complex.real
+                        comp_in_msin += comp_in_complex.imag
+                    else:
+                        comp_out_complex = symbols * comp_in_complex # TEMPORARY
+                        comp_out_cos += comp_out_complex.real
+                        comp_out_msin += comp_out_complex.imag
                 else:
                     comp_out = data_out[spinindex_out]
-                    comp_out += symbols * comp_in # TEMPORARY
+                    if adjoint:
+                        comp_in += np.conj(symbols) * comp_out # TEMPORARY
+                    else:
+                        comp_out += symbols * comp_in # TEMPORARY
 
 
 class SphereEllProduct(SeparableSphereOperator, metaclass=MultiClass):
@@ -2943,23 +3254,26 @@ class PolarMOperator(SpectralOperator):
         # LinearOperator requirements
         self.operand = operand
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        operand = self.args[0]
+        # TODO: check if its faster to make dense matrices of symbols across all components
+        arg = args[0]
         if hasattr(self.output_basis, "m_maps"):
             basis = self.output_basis
         else:
             basis = self.input_basis
         axis = self.last_axis
-        # Set output layout
-        out.preset_layout(operand.layout)
-        out.data[:] = 0
+        if not adjoint:
+            out.data[:] = 0
+        # Return for size-zero data
+        if arg.data.size == 0 or out.data.size == 0:
+            return
         # Apply operator
-        S_in = basis.spin_weights(operand.tensorsig)
+        S_in = basis.spin_weights(arg.tensorsig)
         slices = [slice(None) for i in range(self.dist.dim)]
         for spinindex_in, spintotal_in in np.ndenumerate(S_in):
             for spinindex_out in self.spinindex_out(spinindex_in):
-                comp_in = operand.data[spinindex_in]
+                comp_in = arg.data[spinindex_in]
                 comp_out = out.data[spinindex_out]
                 for m, mg_slice, mc_slice, n_slice in basis.m_maps(self.dist):
                     slices[axis-1] = mc_slice
@@ -2967,8 +3281,11 @@ class PolarMOperator(SpectralOperator):
                     vec_in  = comp_in[tuple(slices)]
                     vec_out = comp_out[tuple(slices)]
                     if vec_in.size and vec_out.size:
-                        A = self.radial_matrix(spinindex_in, spinindex_out, m)
-                        vec_out += apply_matrix(A, vec_in, axis=axis)
+                        matrix = self.radial_matrix(spinindex_in, spinindex_out, m)
+                        if adjoint:
+                            vec_in += apply_matrix(matrix, vec_out, axis=axis, adjoint=True) # TEMPORARY
+                        else:
+                            vec_out += apply_matrix(matrix, vec_in, axis=axis) # TEMPORARY
 
     def subproblem_matrix(self, subproblem):
         operand = self.args[0]
@@ -3152,24 +3469,27 @@ class SphericalEllOperator(SpectralOperator):
     def S2_basis(self):
         return self.input_basis.S2_basis()
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        operand = self.args[0]
+        # TODO: check if its faster to make dense matrices of symbols across all components
+        arg = args[0]
         if self.input_basis is None:
             basis = self.output_basis
         else:
             basis = self.input_basis
         radial_basis = self.radial_basis
         axis = self.dist.last_axis(radial_basis)
-        # Set output layout
-        out.preset_layout(operand.layout)
-        out.data[:] = 0
+        if not adjoint:
+            out.data[:] = 0
+        # Return for size-zero data
+        if arg.data.size == 0 or out.data.size == 0:
+            return
         # Apply operator
-        R_in = radial_basis.regularity_classes(operand.tensorsig)
+        R_in = radial_basis.regularity_classes(arg.tensorsig)
         slices = [slice(None) for i in range(self.dist.dim)]
         for regindex_in, regtotal_in in np.ndenumerate(R_in):
             for regindex_out in self.regindex_out(regindex_in):
-                comp_in = operand.data[regindex_in]
+                comp_in = arg.data[regindex_in]
                 comp_out = out.data[regindex_out]
                 # Should reorder to make ell loop first, check forbidden reg, remove reg from radial_vector_3
                 for ell, m_ind, ell_ind in basis.ell_maps(self.dist):
@@ -3183,7 +3503,10 @@ class SphericalEllOperator(SpectralOperator):
                         vec_out = comp_out[tuple(slices)]
                         if vec_in.size and vec_out.size:
                             A = self.radial_matrix(regindex_in, regindex_out, ell)
-                            vec_out += apply_matrix(A, vec_in, axis=axis)
+                            if adjoint:
+                                vec_in += apply_matrix(A, vec_out, axis=axis, adjoint=True) # TEMPORARY
+                            else:
+                                vec_out += apply_matrix(A, vec_in, axis=axis) # TEMPORARY
 
     def subproblem_matrix(self, subproblem):
         operand = self.args[0]
@@ -3367,14 +3690,16 @@ class CartesianComponent(CartCompBase):
         factors[self.index] = index_factor
         return reduce(sparse.kron, factors, 1).tocsr()
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        arg0 = self.args[0]
-        # Set output layout
-        out.preset_layout(arg0.layout)
-        # Copy specified comonent
-        take_comp = tuple([None] * self.index + [self.coord_subaxis])
-        out.data[:] = arg0.data[take_comp]
+        arg = args[0]
+        comp_slice = tuple([None] * self.index + [self.coord_subaxis])
+        if adjoint:
+            # Add instead of copy for VJP accumulation
+            np.add(arg.data[comp_slice], out.data, out=arg.data[comp_slice])
+        else:
+            # Copy specified component
+            copyto(out.data, arg.data[comp_slice])
 
 
 class DirectProductComponent(CartCompBase):
@@ -3504,13 +3829,14 @@ class CartesianDivergence(Divergence):
         """Build operator matrix for a specific subproblem."""
         return self.args[0].expression_matrices(subproblem, [self.operand])[self.operand]
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        # OPTIMIZE: this has an extra copy
-        arg0 = self.args[0]
-        # Set output layout
-        out.preset_layout(arg0.layout)
-        np.copyto(out.data, arg0.data)
+        # Copy arg data to output components
+        if adjoint:
+            # Add instead of copy for VJP accumulation
+            np.add(args[0].data, out.data, out=args[0].data)
+        else:
+            copyto(out.data, args[0].data)
 
 
 class DirectProductDivergence(Divergence):
@@ -3758,13 +4084,15 @@ class CartesianCurl(Curl):
         # Any layout (addition is done)
         pass
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
         # OPTIMIZE: this has an extra copy
-        arg0 = self.args[0]
-        # Set output layout
-        out.preset_layout(arg0.layout)
-        np.copyto(out.data, arg0.data)
+        arg = args[0]
+        if adjoint:
+            # Add instead of copy for VJP accumulation
+            np.add(arg.data, out.data, out=arg.data)
+        else:
+            copyto(out.data, arg.data)
 
 
 class DirectProductCurl(Curl):
@@ -3960,23 +4288,29 @@ class SphericalCurl(Curl, SphericalEllOperator):
             matrix.tocsr()
             return matrix
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
         if self.dtype == np.complex128:
-            return super().operate(out)
-        operand = self.args[0]
+            return super()._operate(args, out, adjoint)
+        arg = args[0]
+        layout = arg.layout
+        basis = self.input_basis
+        if basis is None:
+            basis = self.output_basis
+        if not adjoint:
+            out.data[:] = 0
+        # Return for size-zero data
+        if arg.data.size == 0 or out.data.size == 0:
+            return
         input_basis = self.input_basis
         radial_basis = self.radial_basis
         axis = self.dist.last_axis(self.radial_basis)
-        # Set output layout
-        out.preset_layout(operand.layout)
-        out.data.fill(0)
         # Apply operator
-        R_in = radial_basis.regularity_classes(operand.tensorsig)
+        R_in = radial_basis.regularity_classes(arg.tensorsig)
         slices = [slice(None) for i in range(self.dist.dim)]
         for regindex_in, regtotal_in in np.ndenumerate(R_in):
             for regindex_out in self.regindex_out(regindex_in):
-                comp_in = operand.data[regindex_in]
+                comp_in = arg.data[regindex_in]
                 comp_out = out.data[regindex_out]
                 # Should reorder to make ell loop first, check forbidden reg, remove reg from radial_vector_3
                 for ell, m_ind, ell_ind in input_basis.ell_maps(self.dist):
@@ -3988,13 +4322,25 @@ class SphericalCurl(Curl, SphericalEllOperator):
                         slices[axis] = radial_basis.n_slice(ell)
                         cos_slice = axslice(axis-2, 0, None, 2)
                         msin_slice = axslice(axis-2, 1, None, 2)
-                        vec_in_cos = comp_in[tuple(slices)][cos_slice]
-                        vec_in_msin = comp_in[tuple(slices)][msin_slice]
-                        vec_in_complex = vec_in_cos + 1j*vec_in_msin
+                        if adjoint:
+                            vec_out_cos = comp_out[tuple(slices)][cos_slice]
+                            vec_out_msin = comp_out[tuple(slices)][msin_slice]
+                            vec_out_complex = vec_out_cos + 1j*vec_out_msin
+                        else:
+                            vec_in_cos = comp_in[tuple(slices)][cos_slice]
+                            vec_in_msin = comp_in[tuple(slices)][msin_slice]
+                            vec_in_complex = vec_in_cos + 1j*vec_in_msin
                         A = self.radial_matrix(regindex_in, regindex_out, ell)
-                        vec_out_complex = apply_matrix(A, vec_in_complex, axis=axis)
-                        comp_out[tuple(slices)][cos_slice] += vec_out_complex.real
-                        comp_out[tuple(slices)][msin_slice] += vec_out_complex.imag
+                        if adjoint:
+                            vec_in_complex = apply_matrix(A, vec_out_complex, axis=axis, adjoint=True) # TEMPORARY
+                        else:
+                            vec_out_complex = apply_matrix(A, vec_in_complex, axis=axis)
+                        if adjoint:
+                            comp_in[tuple(slices)][cos_slice] += vec_in_complex.real
+                            comp_in[tuple(slices)][msin_slice] += vec_in_complex.imag
+                        else:
+                            comp_out[tuple(slices)][cos_slice] += vec_out_complex.real
+                            comp_out[tuple(slices)][msin_slice] += vec_out_complex.imag
 
 
 @alias("lap")
@@ -4071,13 +4417,14 @@ class CartesianLaplacian(Laplacian):
         # Any layout (addition is done)
         pass
 
-    def operate(self, out):
+    def _operate(self, args, out, adjoint=False):
         """Perform operation."""
-        # OPTIMIZE: this has an extra copy
-        arg0 = self.args[0]
-        # Set output layout
-        out.preset_layout(arg0.layout)
-        np.copyto(out.data, arg0.data)
+        arg = args[0]
+        if adjoint:
+            np.add(arg.data, out.data, out=arg.data)
+        else:
+            # OPTIMIZE: this has an extra copy
+            np.copyto(out.data, arg.data)
 
 
 class DirectProductLaplacian(Laplacian):

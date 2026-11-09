@@ -101,7 +101,7 @@ def move_single_axis(a, source, destination):
     return a.transpose(order)
 
 
-def apply_dense(matrix, array, axis, out=None):
+def apply_dense(matrix, array, axis, out=None, overwrite_out=True, adjoint=False):
     """Apply dense matrix along any axis of an array."""
     dim = array.ndim
     # Resolve wraparound axis
@@ -114,7 +114,13 @@ def apply_dense(matrix, array, axis, out=None):
         array_shape = array.shape
         array = array.reshape((array_shape[0], -1)) # May allocate copy
     # Apply matmul
-    temp = np.matmul(matrix, array) # Allocates temp
+    if adjoint:
+        if np.isrealobj(matrix):
+            temp = np.matmul(matrix.T, array) # Allocates temp
+        else:
+            temp = np.matmul(np.conj(matrix.T), array) # Allocates temp and copy of matrix
+    else:
+        temp = np.matmul(matrix, array) # Allocates temp
     # Unflatten later axes
     if dim > 2:
         temp = temp.reshape((temp.shape[0],) + array_shape[1:]) # View
@@ -125,7 +131,10 @@ def apply_dense(matrix, array, axis, out=None):
     if out is None:
         return temp
     else:
-        out[:] = temp # Copy
+        if overwrite_out:
+            out[:] = temp # Copy
+        else:
+            np.add(out, temp, out=out)
         return out
 
 
@@ -137,7 +146,14 @@ def splu_inverse(matrix, permc_spec="NATURAL", **kw):
             return splu.solve(x.real) + 1j*splu.solve(x.imag)
         else:
             return splu.solve(x)
-    return spla.LinearOperator(shape=matrix.shape, dtype=matrix.dtype, matvec=solve, matmat=solve)
+    def solve_adjoint(x):
+        if np.iscomplexobj(x) and matrix.dtype == np.float64:
+            return splu.solve(x.real,trans='H') + 1j*splu.solve(x.imag,trans='H')
+        else:
+            return splu.solve(x,trans='H')
+    return spla.LinearOperator(shape=matrix.shape, dtype=matrix.dtype, matvec=solve, matmat=solve,rmatvec=solve_adjoint,rmatmat=solve_adjoint)
+
+
 
 
 def apply_sparse_dot(matrix, array, axis, out=None):
@@ -168,30 +184,36 @@ def apply_sparse_dot(matrix, array, axis, out=None):
         return out
 
 
-def apply_sparse(matrix, array, axis, out=None, check_shapes=False, num_threads=1):
+def apply_sparse(matrix, array, axis, out=None, check_shapes=False, num_threads=1, overwrite_out=True, adjoint=False):
     """
     Apply sparse matrix along any axis of an array.
-    Must be out of place if ouptut is specified.
+    Must be out of place if output is specified.
     """
     # Check matrix
     if not isinstance(matrix, sparse.csr_matrix):
         raise ValueError("Matrix must be in CSR format.")
+    # Input and output sizes
+    if adjoint:
+        N_out, N_in = matrix.shape[1], matrix.shape[0]
+    else:
+        N_out, N_in = matrix.shape
     # Check output
     if out is None:
         out_shape = list(array.shape)
-        out_shape[axis] = matrix.shape[0]
-        out = np.empty(out_shape, dtype=array.dtype)
+        out_shape[axis] = N_out
+        out = np.zeros(out_shape, dtype=array.dtype)
     elif out is array:
         raise ValueError("Cannot apply in place")
+    elif overwrite_out:
+        out.fill(0)
     # Check shapes
     if check_shapes:
         if not (0 <= axis < array.ndim):
             raise ValueError("Axis out of bounds.")
-        if matrix.shape[1] != array.shape[axis] or matrix.shape[0] != out.shape[axis]:
+        if N_in != array.shape[axis] or N_out != out.shape[axis]:
             raise ValueError("Matrix shape mismatch.")
     # Old way if requested
-    if OLD_CSR_MATVECS and array.ndim == 2 and axis == 0:
-        out.fill(0)
+    if OLD_CSR_MATVECS and array.ndim == 2 and axis == 0 and not adjoint:
         return csr_matvecs(matrix, array, out)
     # Promote datatypes
     # TODO: find way to optimize this with fused types
@@ -199,13 +221,13 @@ def apply_sparse(matrix, array, axis, out=None, check_shapes=False, num_threads=
     if matrix_data.dtype != out.dtype:
         matrix_data = matrix_data.astype(out.dtype)
     # Call cython routine
-    cython_linalg.apply_csr(matrix.indptr, matrix.indices, matrix_data, array, out, axis, num_threads)
+    cython_linalg.apply_csr(matrix.indptr, matrix.indices, matrix_data, array, out, axis, num_threads, adjoint)
     return out
 
 
-def solve_upper_sparse(matrix, rhs, axis, out=None, check_shapes=False, num_threads=1):
+def solve_upper_sparse(matrix, rhs, axis, out=None, check_shapes=False, num_threads=1, adjoint=False):
     """
-    Solve upper triangular sparse matrix along any axis of an array.
+    Solve upper triangular sparse matrix (or its adjoint) along any axis of an array.
     Matrix assumed to be nonzero on the diagonals.
     """
     # Check matrix
@@ -229,7 +251,36 @@ def solve_upper_sparse(matrix, rhs, axis, out=None, check_shapes=False, num_thre
         if not (matrix.shape[0] == matrix.shape[1] == rhs.shape[axis]):
             raise ValueError("Matrix shape mismatch.")
     # Call cython routine
-    cython_linalg.solve_upper_csr(matrix.indptr, matrix.indices, matrix_data, out, axis, num_threads)
+    cython_linalg.solve_upper_csr(matrix.indptr, matrix.indices, matrix_data, out, axis, num_threads, adjoint)
+
+
+def solve_lower_sparse(matrix, rhs, axis, out=None, check_shapes=False, num_threads=1):
+    """
+    Solve lower triangular sparse matrix along any axis of an array.
+    Matrix assumed to be nonzero on the diagonals.
+    """
+    # Check matrix
+    if not isinstance(matrix, sparse.csr_matrix):
+        raise ValueError("Matrix must be in CSR format.")
+    if not matrix._has_canonical_format: # avoid property hook (without underscore)
+        matrix.sum_duplicates()
+    # Setup output = rhs
+    if out is None:
+        out = np.copy(rhs)
+    elif out is not rhs:
+        np.copyto(out, rhs)
+    # Promote datatypes
+    matrix_data = matrix.data
+    if matrix_data.dtype != rhs.dtype:
+        matrix_data = matrix_data.astype(rhs.dtype)
+    # Check shapes
+    if check_shapes:
+        if not (0 <= axis < rhs.ndim):
+            raise ValueError("Axis out of bounds.")
+        if not (matrix.shape[0] == matrix.shape[1] == rhs.shape[axis]):
+            raise ValueError("Matrix shape mismatch.")
+    # Call cython routine
+    cython_linalg.solve_lower_csr(matrix.indptr, matrix.indices, matrix_data, out, axis, num_threads)
 
 
 def csr_matvec(A_csr, x_vec, out_vec):
@@ -442,6 +493,53 @@ def scipy_sparse_eigs(A, B, left, N, target, matsolver, **kw):
         return evals, evecs, left_evals, left_evecs
     else:
         return evals, evecs
+
+def scipy_sparse_eigs_adj(A, B, N, target, matsolver, **kw):
+    """
+    Perform targeted eigenmode search using the scipy/ARPACK sparse solver
+    for the reformulated generalized eigenvalue problem
+
+        A.x = λ B.x  ==>  (A - σB)^I B.x = (1/(λ-σ)) x
+
+    for eigenvalues λ near the target σ.
+
+    Parameters
+    ----------
+    A, B : scipy sparse matrices
+        Sparse matrices for generalized eigenvalue problem
+    N : int
+        Number of eigenmodes to return
+    target : complex
+        Target σ for eigenvalue search
+    matsolver : matrix solver class
+        Class implementing solve method for solving sparse systems.
+
+    Other keyword options passed to scipy.sparse.linalg.eigs.
+    """
+    # Build sparse linear operator representing (A - σB)^I B = C^I B = D
+    C = A - target * B
+    solver = matsolver(C)
+    def matvec(x):
+        return solver.solve(B.dot(x))
+
+    D = spla.LinearOperator(dtype=A.dtype, shape=A.shape, matvec=matvec)
+
+    # Build sparse linear operator representing (A^H - σB^H)^I B^H = C^-H B^H = D_adj
+    # Note: D_adj is not equal to D^H
+
+    def matvec_adj(x):
+        return solver.solve_adjoint(B.H.dot(x))
+
+    D_adj = spla.LinearOperator(dtype=A.dtype, shape=A.shape, matvec=matvec_adj)
+
+    # Solve using scipy sparse algorithm
+    evals, evecs = spla.eigs(D, k=N, which='LM', sigma=None, **kw)
+    evals_adjoint, evecs_adjoint = spla.eigs(D_adj, k=N, which='LM', sigma=None, **kw)
+
+    # Rectify eigenvalues
+    evals = 1 / evals + target
+    evals_adjoint = 1 / evals_adjoint + np.conj(target)
+    return evals, evecs, evals_adjoint, evecs_adjoint
 
 
 def interleave_matrices(matrices):
