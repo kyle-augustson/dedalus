@@ -23,6 +23,7 @@ from .field import Operand, Field, LockedField
 from .future import Future, FutureField, FutureLockedField
 from ..tools.array import reshape_vector, apply_matrix, add_sparse, axindex, axslice, perm_matrix, copyto, sparse_block_diag, interleave_matrices
 from ..tools.cache import CachedAttribute, CachedMethod
+from ..tools import fastpaths
 from ..tools.dispatch import MultiClass
 from ..tools.exceptions import NonlinearOperatorError
 from ..tools.exceptions import SymbolicParsingError
@@ -3471,6 +3472,8 @@ class SphericalEllOperator(SpectralOperator):
 
     def _operate(self, args, out, adjoint=False):
         """Perform operation."""
+        if not adjoint and fastpaths.ell_operate(self, args[0], out, curl_like=False):
+            return
         # TODO: check if its faster to make dense matrices of symbols across all components
         arg = args[0]
         if self.input_basis is None:
@@ -4292,6 +4295,8 @@ class SphericalCurl(Curl, SphericalEllOperator):
         """Perform operation."""
         if self.dtype == np.complex128:
             return super()._operate(args, out, adjoint)
+        if not adjoint and fastpaths.ell_operate(self, args[0], out, curl_like=True):
+            return out
         arg = args[0]
         layout = arg.layout
         basis = self.input_basis

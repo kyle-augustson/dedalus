@@ -15,6 +15,7 @@ from ..tools import jacobi
 from ..tools.array import apply_matrix, apply_dense, axslice, solve_upper_sparse, apply_sparse
 from ..tools.cache import CachedAttribute
 from ..tools.cache import CachedMethod
+from ..tools import fastpaths
 
 import logging
 logger = logging.getLogger(__name__.split('.')[-1])
@@ -1619,6 +1620,8 @@ class SWSHColatitudeTransform(NonSeparableTransform):
         self.s = s
 
     def forward_reduced(self, gdata, cdata):
+        if fastpaths.swsh_forward(self, gdata, cdata):
+            return
         # local_m = self.local_m
         # if gdata.shape[1] != len(local_m): # do we want to do this check???
         #     raise ValueError("gdata.shape[1]: %i, len(local_m): %i" %(gdata.shape[1], len(local_m)))
@@ -1633,6 +1636,8 @@ class SWSHColatitudeTransform(NonSeparableTransform):
                 apply_matrix(m_matrices[m], grm, axis=2, out=crm)
 
     def backward_reduced(self, cdata, gdata):
+        if fastpaths.swsh_backward(self, cdata, gdata):
+            return
         # local_m = self.local_m
         # if gdata.shape[1] != len(local_m): # do we want to do this check???
         #     raise ValueError("gdata.shape[1]: %i, len(local_m): %i" %(gdata.shape[1], len(local_m)))

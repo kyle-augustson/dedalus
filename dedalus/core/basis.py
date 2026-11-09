@@ -12,6 +12,7 @@ from ..tools.array import kron, axslice, apply_matrix, permute_axis
 from ..tools.cache import CachedAttribute, CachedMethod, CachedClass
 from ..tools import jacobi
 from ..tools import clenshaw
+from ..tools import fastpaths
 from ..tools.array import reshape_vector, axindex, axslice, interleave_matrices
 from ..tools.dispatch import MultiClass, SkipDispatchException
 from ..tools.general import unify, DeferredTuple
@@ -1779,10 +1780,14 @@ class AverageRealFourier(operators.Average, operators.SpectralOperator1D):
 class MultidimensionalBasis(Basis):
 
     def forward_transform(self, field, axis, gdata, cdata):
+        if fastpaths.md_forward(self, field, axis, gdata, cdata):
+            return
         subaxis = axis - field.dist.get_basis_axis(self)
         return self.forward_transforms[subaxis](field, axis, gdata, cdata)
 
     def backward_transform(self, field, axis, cdata, gdata):
+        if fastpaths.md_backward(self, field, axis, cdata, gdata):
+            return
         subaxis = axis - field.dist.get_basis_axis(self)
         return self.backward_transforms[subaxis](field, axis, cdata, gdata)
 
@@ -3952,6 +3957,8 @@ class RegularityBasis(SpinRecombinationBasis, MultidimensionalBasis):
         return valid
 
     def forward_regularity_recombination(self, tensorsig, axis, gdata, ell_maps):
+        if fastpaths.recombine(self, tensorsig, axis, gdata, ell_maps, True):
+            return
         rank = len(tensorsig)
         ell_list = tuple(map[0] for map in ell_maps)
         # Apply radial recombinations
@@ -3969,6 +3976,8 @@ class RegularityBasis(SpinRecombinationBasis, MultidimensionalBasis):
                 apply_matrix(Q[ell].T, temp_ell, axis=0, out=temp_ell)
 
     def backward_regularity_recombination(self, tensorsig, axis, gdata, ell_maps):
+        if fastpaths.recombine(self, tensorsig, axis, gdata, ell_maps, False):
+            return
         rank = len(tensorsig)
         ell_list = tuple(map[0] for map in ell_maps)
         # Apply radial recombinations

@@ -23,6 +23,7 @@ from .basis import Basis
 from .operators import convert
 from ..tools.array import kron
 from ..tools.cache import CachedAttribute, CachedMethod
+from ..tools import fastpaths
 from ..tools.dispatch import MultiClass
 from ..tools.exceptions import NonlinearOperatorError
 from ..tools.exceptions import SymbolicParsingError
@@ -716,6 +717,8 @@ class DotProduct(Product, FutureField):
         return G
 
     def operate(self, out):
+        if fastpaths.dot_operate(self, out):
+            return
         """Perform operation."""
         arg0, arg1 = self.args
         out.preset_layout(arg0.layout)
@@ -835,6 +838,8 @@ class CrossProduct(Product, FutureField):
             self.operate_vjp = self.operate_vjp_left_handed
 
     def operate_right_handed(self, out):
+        if fastpaths.cross_operate(self, out, True):
+            return
         arg0, arg1 = self.args
         out.preset_layout(arg0.layout)
         arg0_data = self.arg0_ghost_broadcaster.cast(arg0)
@@ -846,6 +851,8 @@ class CrossProduct(Product, FutureField):
         ne.evaluate("data00*data11 - data01*data10", out=out.data[2])
 
     def operate_left_handed(self, out):
+        if fastpaths.cross_operate(self, out, False):
+            return
         arg0, arg1 = self.args
         out.preset_layout(arg0.layout)
         arg0_data = self.arg0_ghost_broadcaster.cast(arg0)
