@@ -4,7 +4,7 @@ Classes for future evaluation.
 """
 
 import numpy as np
-from functools import partial
+from functools import partial, wraps
 
 from .field import Operand, Field, LockedField
 from .domain import Domain
@@ -18,6 +18,18 @@ logger = logging.getLogger(__name__.split('.')[-1])
 from ..tools.config import config
 STORE_OUTPUTS = config['memory'].getboolean('STORE_OUTPUTS')
 STORE_LAST_DEFAULT = config['memory'].getboolean('STORE_LAST_DEFAULT')
+
+
+def _record_construction(init):
+    """Wrap a Future subclass __init__ to record the constructor arguments (the outermost call records)."""
+    @wraps(init)
+    def __init__(self, *args, **kw):
+        if '_construction' not in self.__dict__:
+            self._construction = (type(self), args, kw)
+        init(self, *args, **kw)
+    __init__._records_construction = True
+    return __init__
+
 
 class Future(Operand):
     """
@@ -40,6 +52,13 @@ class Future(Operand):
     """
 
     store_last = STORE_LAST_DEFAULT
+
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+        # Record constructor arguments for common-subexpression elimination (core/subexpressions.py)
+        init = cls.__dict__.get('__init__')
+        if init is not None and not getattr(init, '_records_construction', False):
+            cls.__init__ = _record_construction(init)
 
     def __init__(self, *args, out=None):
         # # Check output consistency
