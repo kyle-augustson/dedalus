@@ -13,6 +13,7 @@ from math import prod
 
 from .future import FutureField, FutureLockedField
 from .field import Field, LockedField
+from . import subexpressions
 from .operators import Copy
 from ..tools.cache import CachedAttribute
 from ..tools.general import OrderedSet
@@ -47,6 +48,7 @@ class Evaluator:
         self.vars = vars
         self.handlers = []
         self.groups = defaultdict(list)
+        self._subexpression_state = None
 
     def add_dictionary_handler(self, **kw):
         """Create a dictionary handler and add to evaluator."""
@@ -95,6 +97,14 @@ class Evaluator:
 
     def evaluate_handlers(self, handlers, id=None, tape=None, **kw):
         """Evaluate a collection of handlers."""
+
+        # Merge identical subexpressions across all handlers whenever the handlers or their tasks change
+        if subexpressions.ENABLED:
+            state = tuple((h, len(h.tasks)) for h in self.handlers)    # (the id argument shadows id())
+            if state != self._subexpression_state:
+                self._subexpression_state = state
+                merged = subexpressions.eliminate(self.handlers)
+                logger.debug("Merged %i common subexpressions across %i handlers" % (merged, len(self.handlers)))
 
         # Default to a new id to cache within evaluation, but not across evaluations
         # (a process-local counter: uuid4 reads os.urandom, which can cost a fraction of a millisecond per call)
