@@ -816,16 +816,26 @@ class Field(Current):
         # Shortcut for serial execution
         if self.dist.comm.size == 1:
             return self.data.copy()
-        # TODO: Shortcut this for constant fields
-        # Gather data
-        # Should be optimized via Gatherv eventually
-        pieces = self.dist.comm.gather(self.data, root=root)
+        # Gather the nonempty local blocks with their global offsets, and place them on the root. This is the array
+        # that assembling all blocks with np.block gives, without pickling and concatenating the empty ones (most
+        # of them for reduced outputs such as volume integrals or profiles).
+        piece = None
+        if self.data.size:
+            elements = self.layout.local_elements(self.domain, self.scales)
+            piece = (tuple(int(e[0]) for e in elements), self.data)
+        pieces = self.dist.comm.gather(piece, root=root)
         # Assemble on root node
         if self.dist.comm.rank == root:
-            ext_mesh = self.layout.ext_mesh
-            combined = np.zeros(prod(ext_mesh), dtype=object)
-            combined[:] = pieces
-            return np.block(combined.reshape(ext_mesh).tolist())
+            tensor_shape = tuple(cs.dim for cs in self.tensorsig)
+            global_shape = tensor_shape + tuple(self.layout.global_shape(self.domain, self.scales))
+            out = np.zeros(global_shape, dtype=self.data.dtype)
+            ntensor = len(tensor_shape)
+            for piece in pieces:
+                if piece is not None:
+                    start, data = piece
+                    index = tuple(slice(s, s + n) for s, n in zip(start, data.shape[ntensor:]))
+                    out[(Ellipsis,) + index] = data
+            return out
 
     def allreduce_data_norm(self, layout=None, order=2):
         # Change layout
