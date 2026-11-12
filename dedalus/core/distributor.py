@@ -20,7 +20,8 @@ from ..tools.general import OrderedSet
 logger = logging.getLogger(__name__.split('.')[-1])
 GROUP_TRANSFORMS = config['transforms'].getboolean('GROUP_TRANSFORMS')
 TRANSPOSE_LIBRARY = config['parallelism'].get('TRANSPOSE_LIBRARY')
-GROUP_TRANSPOSES = config['parallelism'].getboolean('GROUP_TRANSPOSES')
+GROUP_TRANSPOSES = config['parallelism'].get('GROUP_TRANSPOSES')
+GROUP_TRANSPOSES_RANKS = config['parallelism'].getint('GROUP_TRANSPOSES_RANKS', fallback=2048)
 SYNC_TRANSPOSES = config['parallelism'].getboolean('SYNC_TRANSPOSES')
 MESH_AXIS0_NODE_LOCAL = config['parallelism'].getboolean('MESH_AXIS0_NODE_LOCAL', fallback=False)
 
@@ -29,6 +30,25 @@ if TRANSPOSE_LIBRARY.upper() == 'FFTW':
 elif TRANSPOSE_LIBRARY.upper() == 'MPI':
     from .transposes import AlltoallvTranspose as TransposePlanner
 from .transposes import RowDistributor, ColDistributor
+
+
+def group_transposes(size):
+    """
+    Whether to transpose several fields together on a run with the given total number of ranks.
+    GROUP_TRANSPOSES is true, false, or auto: group only above GROUP_TRANSPOSES_RANKS ranks.
+    Read on every call, so a script may also assign True, False or "auto" to distributor.GROUP_TRANSPOSES.
+    """
+    value = GROUP_TRANSPOSES
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value == 'auto':
+        return size > GROUP_TRANSPOSES_RANKS
+    if value in ('1', 'yes', 'true', 'on'):
+        return True
+    if value in ('0', 'no', 'false', 'off'):
+        return False
+    raise ValueError("GROUP_TRANSPOSES must be true, false, or auto, not %r" % GROUP_TRANSPOSES)
 
 # Public interface
 __all__ = ['Distributor']
@@ -722,6 +742,7 @@ class Transpose:
         comm_cart_axis = axis - np.sum(mesh[:axis]==1)
         remain_dims[comm_cart_axis] = 1
         self.comm_sub = comm_cart.Sub(remain_dims)
+        self.size = comm_cart.Get_size()
 
     @CachedMethod
     def _sub_shape(self, domain, scales):
@@ -781,7 +802,7 @@ class Transpose:
             self.comm_sub.Barrier()
         if len(fields) == 1:
             self.increment_single(*fields)
-        elif GROUP_TRANSPOSES:
+        elif group_transposes(self.size):
             self.increment_group(fields)
         else:
             for field in fields:
@@ -793,7 +814,7 @@ class Transpose:
             self.comm_sub.Barrier()
         if len(fields) == 1:
             self.decrement_single(*fields)
-        elif GROUP_TRANSPOSES:
+        elif group_transposes(self.size):
             self.decrement_group(fields)
         else:
             for field in fields:
