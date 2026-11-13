@@ -950,7 +950,7 @@ class Transpose:
             else:
                 # No communication: just update field layouts
                 for field in fields:
-                    field.preset_layout(self.layout1)
+                    field.preset_layout(self.layout0)
 
     # def increment_group(self, *fields):
     #     """Transpose group from layout0 to layout1."""
