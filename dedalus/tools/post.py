@@ -275,11 +275,10 @@ def merge_setup(joint_file, proc_paths, virtual=False):
                                                     shape=joint_shape,
                                                     dtype=proc_dset.dtype,
                                                     chunks=True)
-            # Dataset metadata
-            joint_dset.attrs['task_number'] = proc_dset.attrs['task_number']
-            joint_dset.attrs['constant'] = proc_dset.attrs['constant']
-            joint_dset.attrs['grid_space'] = proc_dset.attrs['grid_space']
-            joint_dset.attrs['scales'] = proc_dset.attrs['scales']
+            # Dataset metadata (task_number is no longer written by the file handlers)
+            for key in ['task_number', 'constant', 'grid_space', 'scales']:
+                if key in proc_dset.attrs:
+                    joint_dset.attrs[key] = proc_dset.attrs[key]
 
             for i, proc_dim in enumerate(proc_dset.dims):
                 joint_dset.dims[i].label = proc_dim.label
@@ -291,6 +290,10 @@ def merge_setup(joint_file, proc_paths, virtual=False):
                 else:
                     if proc_dim.label == 'constant' or proc_dim.label == '':
                         scalename = 'constant'
+                    elif virtual and len(proc_dim):
+                        # The scales group was copied: attach the same scale (the file handlers name them
+                        # '<coord>_hash_<sha1>', not 'hash_<sha1>')
+                        scalename = pathlib.PurePosixPath(proc_dim[0].name).name
                     else:
                         hashval = hashlib.sha1(np.array(proc_dset.dims[i][0])).hexdigest()
                         scalename = 'hash_' + hashval
