@@ -38,6 +38,18 @@ def build_periodic_cylindrical_annulus(Nz, Nphi, Nr, alpha, k, dealias, dtype):
     return c, d, (bz, bp), z, phi, r, x, y
 
 
+def resolved(operator):
+    """
+    Evaluate a derivative of the test fields and keep the lower half of its radial modes. The derivatives leave roundoff
+    in the top radial modes; the NCC product truncates that unresolved part exactly in the output basis while the
+    grid-evaluated product truncates it differently, which with k > 0 shows up as large grid-space differences.
+    The products of the filtered fields are resolved, so both evaluations agree to roundoff.
+    """
+    field = operator.evaluate()
+    field.low_pass_filter(scales=(1, 1, 0.5))
+    return field
+
+
 Nz_range = [8]
 Nphi_range = [16]
 Nr_range = [16]
@@ -98,7 +110,7 @@ def test_scalar_prod_vector(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_f
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    u = operators.Gradient(g, c).evaluate()
+    u = resolved(operators.Gradient(g, c))
     vars = [u]
     if ncc_first:
         w0 = f * u
@@ -132,7 +144,7 @@ def test_scalar_prod_tensor(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_f
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    T = operators.Gradient(operators.Gradient(g, c), c).evaluate()
+    T = resolved(operators.Gradient(operators.Gradient(g, c), c))
     vars = [T]
     if ncc_first:
         w0 = f * T
@@ -166,7 +178,7 @@ def test_vector_prod_scalar(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_f
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    u = operators.Gradient(f, c).evaluate()
+    u = resolved(operators.Gradient(f, c))
     vars = [g]
     if ncc_first:
         w0 = u * g
@@ -200,8 +212,8 @@ def test_vector_prod_vector(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_f
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    u = operators.Gradient(f, c).evaluate()
-    v = operators.Gradient(g, c).evaluate()
+    u = resolved(operators.Gradient(f, c))
+    v = resolved(operators.Gradient(g, c))
     vars = [v]
     if ncc_first:
         w0 = u * v
@@ -235,8 +247,8 @@ def test_vector_dot_vector(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_fi
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    u = operators.Gradient(f, c).evaluate()
-    v = operators.Gradient(g, c).evaluate()
+    u = resolved(operators.Gradient(f, c))
+    v = resolved(operators.Gradient(g, c))
     vars = [v]
     if ncc_first:
         w0 = dot(u, v)
@@ -270,8 +282,8 @@ def test_vector_dot_tensor(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_fi
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    u = operators.Gradient(f, c).evaluate()
-    T = operators.Gradient(operators.Gradient(g, c), c).evaluate()
+    u = resolved(operators.Gradient(f, c))
+    T = resolved(operators.Gradient(operators.Gradient(g, c), c))
     vars = [T]
     if ncc_first:
         w0 = dot(u, T)
@@ -305,7 +317,7 @@ def test_tensor_prod_scalar(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_f
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    T = operators.Gradient(operators.Gradient(f, c), c).evaluate()
+    T = resolved(operators.Gradient(operators.Gradient(f, c), c))
     vars = [g]
     if ncc_first:
         U0 = T * g
@@ -339,8 +351,8 @@ def test_tensor_dot_vector(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_fi
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    T = operators.Gradient(operators.Gradient(f, c), c).evaluate()
-    u = operators.Gradient(g, c).evaluate()
+    T = resolved(operators.Gradient(operators.Gradient(f, c), c))
+    u = resolved(operators.Gradient(g, c))
     vars = [u]
     if ncc_first:
         w0 = dot(T, u)
@@ -374,8 +386,8 @@ def test_tensor_dot_tensor(Nz, Nphi, Nr, alpha, k, dealias, dtype, basis, ncc_fi
     g.preset_scales(dealias)
     f['g'] = r**4
     g['g'] = 3*x**2 + 2*y + x*np.sin(4*np.pi*z/length)
-    U = operators.Gradient(operators.Gradient(f, c), c).evaluate()
-    T = operators.Gradient(operators.Gradient(g, c), c).evaluate()
+    U = resolved(operators.Gradient(operators.Gradient(f, c), c))
+    T = resolved(operators.Gradient(operators.Gradient(g, c), c))
     vars = [T]
     if ncc_first:
         W0 = dot(T, U)

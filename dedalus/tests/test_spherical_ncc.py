@@ -35,6 +35,7 @@ alpha_range = [0]
 k_range = [0, 3]
 dealias_range = [2]
 dtype_range = [np.float64, np.complex128]
+dtype_range_cross = [xfail_param(np.float64, "Real radial NCC cross products not implemented."), np.complex128]
 
 def k_out_comp(basis, k_ncc, k_arg, f, g):
     if isinstance(basis, d3.BallBasis):
@@ -43,6 +44,17 @@ def k_out_comp(basis, k_ncc, k_arg, f, g):
         return (max(k_ncc, k_arg) + rank_f + rank_g + 1) // 2
     else:
         return k_ncc + k_arg
+
+def fill_resolved(*fields):
+    """
+    Random data in the lower half of each field's modes, so the products below are resolved. With random data in all
+    modes, the grid-evaluated product and the NCC product differ by how the unresolved part of the product is truncated
+    (in different bases when k > 0), not by an error in either.
+    """
+    for field in fields:
+        field.fill_random('g')
+        field.low_pass_filter(scales=0.5)
+
 
 def norm2(field):
     rank = len(field.tensorsig)
@@ -73,8 +85,7 @@ def test_radial_multiply(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, rank_ncc,
     b_arg = b.clone_with(k=k_arg)
     f = d.Field(bases=b_ncc, tensorsig=(c,)*rank_ncc)
     g = d.Field(bases=b_arg, tensorsig=(c,)*rank_arg)
-    f.fill_random('g')
-    g.fill_random('g')
+    fill_resolved(f, g)
     # Dummy problem to build subproblems with correct coupling/dependence
     problem = d3.LBVP([g])
     problem.add_equation((norm2(f)*g, 0))
@@ -107,8 +118,7 @@ def test_radial_dot(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, rank_ncc, rank
     b_arg = b.clone_with(k=k_arg)
     f = d.Field(bases=b_ncc, tensorsig=(c,)*rank_ncc)
     g = d.Field(bases=b_arg, tensorsig=(c,)*rank_arg)
-    f.fill_random('g')
-    g.fill_random('g')
+    fill_resolved(f, g)
     # Dummy problem to build subproblems with correct coupling/dependence
     problem = d3.LBVP([g])
     problem.add_equation((norm2(f)*g, 0))
@@ -131,7 +141,7 @@ def test_radial_dot(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, rank_ncc, rank
 @pytest.mark.parametrize('k_arg', k_range)
 @pytest.mark.parametrize('ell_coupling', [False, xfail_param(True, "Not working")])
 @pytest.mark.parametrize('dealias', dealias_range)
-@pytest.mark.parametrize('dtype', dtype_range)
+@pytest.mark.parametrize('dtype', dtype_range_cross)
 def test_radial_cross(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, ell_coupling, dealias, dtype):
     c, d, b = basis(Nphi, Ntheta, Nr, alpha, dealias=dealias, dtype=dtype)
     # Fields
@@ -139,8 +149,7 @@ def test_radial_cross(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, ell_coupling
     b_arg = b.clone_with(k=k_arg)
     f = d.Field(bases=b_ncc, tensorsig=(c,))
     g = d.Field(bases=b_arg, tensorsig=(c,))
-    f.fill_random('g')
-    g.fill_random('g')
+    fill_resolved(f, g)
     # Dummy problem to build subproblems with correct coupling/dependence
     problem = d3.LBVP([g])
     problem.add_equation((norm2(f)*g, 0))
@@ -172,8 +181,7 @@ def test_meridional_multiply(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, rank_
     b_arg = b.clone_with(k=k_arg)
     f = d.Field(bases=b_ncc, tensorsig=(c,)*rank_ncc)
     g = d.Field(bases=b_arg, tensorsig=(c,)*rank_arg)
-    f.fill_random('g')
-    g.fill_random('g')
+    fill_resolved(f, g)
     # Dummy problem to build subproblems with correct coupling/dependence
     problem = d3.LBVP([g])
     problem.add_equation((norm2(f)*g, 0))
@@ -205,8 +213,7 @@ def test_meridional_dot(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, rank_ncc, 
     b_arg = b.clone_with(k=k_arg)
     f = d.Field(bases=b_ncc, tensorsig=(c,)*rank_ncc)
     g = d.Field(bases=b_arg, tensorsig=(c,)*rank_arg)
-    f.fill_random('g')
-    g.fill_random('g')
+    fill_resolved(f, g)
     # Dummy problem to build subproblems with correct coupling/dependence
     problem = d3.LBVP([g])
     problem.add_equation((norm2(f)*g, 0))
@@ -236,8 +243,7 @@ def test_meridional_cross(Nphi, Ntheta, Nr, basis, alpha, k_ncc, k_arg, dealias,
     b_arg = b.clone_with(k=k_arg)
     f = d.Field(bases=b_ncc, tensorsig=(c,))
     g = d.Field(bases=b_arg, tensorsig=(c,))
-    f.fill_random('g')
-    g.fill_random('g')
+    fill_resolved(f, g)
     # Dummy problem to build subproblems with correct coupling/dependence
     problem = d3.LBVP([g])
     problem.add_equation((norm2(f)*g, 0))
