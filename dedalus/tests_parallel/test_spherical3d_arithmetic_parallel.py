@@ -7,6 +7,8 @@ from mpi4py import MPI
 
 
 comm = MPI.COMM_WORLD
+# The tests use a (2, 2) process mesh
+pytestmark = pytest.mark.skipif(comm.size != 4, reason="needs exactly 4 processes (mesh (2, 2))")
 
 
 Nphi_range = [8]
